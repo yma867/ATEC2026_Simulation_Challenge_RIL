@@ -1,0 +1,15 @@
+# ATEC 2026 Task B — Perception Layer Dependencies
+# perception conda env: Python 3.11 + CUDA 12.1
+
+ultralytics>=8.0.0
+torch>=2.0.0
+torchvision>=0.16.0
+numpy>=1.24.0,<2.0.0     # ⚠️ 必须 <2.0, 否则与 isaaclab / scipy 不兼容
+opencv-python>=4.5.0
+scipy>=1.10.0            # scipy 1.15+ 也兼容 numpy 1.26.x (仅 warning, 不影响运行)
+
+# ═══════════════════════════════════════════════════════
+# isaaclab 环境的安装命令 (不要用 pip install -r):
+#   conda activate isaaclab
+#   pip install "numpy<2.0.0" scipy ultralytics opencv-python
+# ═══════════════════════════════════════════════════════
