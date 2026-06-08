@@ -12,6 +12,7 @@ Run the following command from the repository root:
 
 ```bash
 python scripts/rsl_rl/train.py --task ATEC-Isaac-Velocity-Flat-Unitree-B2-v0 --headless --video
+python scripts/rsl_rl/train.py --task ATEC-Isaac-Velocity-Flat-Unitree-B2-Piper-v0 --headless --video
 ```
 
 On an **NVIDIA RTX 5090**, this example typically takes around **90 minutes**.
@@ -24,6 +25,7 @@ After training, evaluate with:
 
 ```bash
 python scripts/rsl_rl/play.py --task ATEC-Isaac-Velocity-Flat-Unitree-B2-v0
+python scripts/rsl_rl/play.py --task ATEC-Isaac-Velocity-Flat-Unitree-B2-Piper-v0
 ```
 
 This loads the trained checkpoint and runs rollout in the same task setting.

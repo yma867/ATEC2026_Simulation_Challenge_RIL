@@ -29,6 +29,12 @@ parser.add_argument(
     default=False,
     help="Enable debug prints for per-step reward/time metrics.",
 )
+parser.add_argument(
+    "--gt_nav",
+    action="store_true",
+    default=False,
+    help="Enable GT navigation mode (directly read object positions from simulation).",
+)
 
 # Isaac Sim / Kit args
 AppLauncher.add_app_launcher_args(parser)
@@ -59,8 +65,6 @@ from isaaclab_tasks.utils import parse_env_cfg
 from rl_utils import camera_follow
 from atec_rl_lab.tasks.task_base.action_base import apply_safe_action_spec
 
-from demo.solution import AlgSolution
-solution = AlgSolution()
 
 def play() -> tuple[float, float]:
     if args_cli.task is None:
@@ -77,14 +81,6 @@ def play() -> tuple[float, float]:
         use_fabric=not args_cli.disable_fabric
     )
 
-    # TODO: simulate getting action spec from jason string (e.g. from a file or network)
-    action_spec = solution.get_action_spec() if hasattr(solution, "get_action_spec") else None
-    action_spec_json = json.dumps(action_spec) if action_spec else None
-
-    # New Feature: apply safe action spec to env config (e.g. for scaling/clipping actions from your solution)
-    if action_spec_json:
-        env_cfg = apply_safe_action_spec(env_cfg, action_spec_json)
-    
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
     # Convert MARL -> single agent if needed (kept from your original script)
@@ -106,6 +102,25 @@ def play() -> tuple[float, float]:
         print_dict(video_kwargs, nesting=4)
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
+    # -------------------------------------------------------------------------
+    # Initialize solution (dynamic import based on --gt_nav flag)
+    # -------------------------------------------------------------------------
+    global solution
+    if args_cli.gt_nav:
+        print("[INFO] Enabling GT Navigation mode")
+        from demo.solution_gt import AlgSolution
+        solution = AlgSolution(env=env)
+    else:
+        from demo.solution import AlgSolution
+        solution = AlgSolution()
+
+    # TODO: simulate getting action spec from jason string (e.g. from a file or network)
+    action_spec = solution.get_action_spec() if hasattr(solution, "get_action_spec") else None
+    action_spec_json = json.dumps(action_spec) if action_spec else None
+
+    # New Feature: apply safe action spec to env config (e.g. for scaling/clipping actions from your solution)
+    if action_spec_json:
+        env_cfg = apply_safe_action_spec(env_cfg, action_spec_json)
 
     # -------------------------------------------------------------------------
     # Reset

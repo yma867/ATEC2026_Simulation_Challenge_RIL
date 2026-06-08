@@ -11,6 +11,11 @@ import torch
 from ultralytics import YOLO
 from scipy.spatial.transform import Rotation as R
 
+try:
+    import cv2
+except Exception:
+    cv2 = None
+
 from config import (
     HEAD_CAM, EE_CAM,
     HEAD_CAM_POS_ROBOT, HEAD_CAM_PITCH_RAD,
@@ -203,6 +208,19 @@ class PerceptionPipeline:
         # ---- ByteTrack ----
         self.tracker = ByteTracker()
 
+        self.visualize = os.getenv("ATEC_TASKB_VIS", "0").lower() in {"1", "true", "yes", "on"}
+        self.vis_every = max(1, int(os.getenv("ATEC_TASKB_VIS_EVERY", "5")))
+        self.vis_dir = os.getenv("ATEC_TASKB_VIS_DIR", os.path.join(os.path.dirname(__file__), "debug_vis"))
+        self.vis_show_rgb = os.getenv("ATEC_TASKB_VIS_SHOW_RGB", "1").lower() in {"1", "true", "yes", "on"}
+        self.vis_save_yolo = os.getenv("ATEC_TASKB_VIS_SAVE_YOLO", "1").lower() in {"1", "true", "yes", "on"}
+        if self.visualize:
+            os.makedirs(self.vis_dir, exist_ok=True)
+            if cv2 is None:
+                print("[TaskB-VIS] cv2 is unavailable; visualization disabled.", flush=True)
+                self.visualize = False
+            else:
+                print(f"[TaskB-VIS] showing head/end-effector RGB and saving YOLO debug images to {self.vis_dir}", flush=True)
+
         # ---- 相机内参矩阵 (torch) ----
         self.K_head = torch.tensor([
             [HEAD_CAM['fx'], 0, HEAD_CAM['cx']],
@@ -212,12 +230,24 @@ class PerceptionPipeline:
 
         self.K_head_inv = torch.inverse(self.K_head)
 
-        # ---- head camera 外参旋转矩阵 (预计算自 config.py) ----
-        # cam2robot: OpenCV 相机坐标系 → 机器人坐标系 (含俯仰角)
-        # robot2cam: 逆变换 (用于投影/反投影验证)
-        self.head_cam2robot = HEAD_CAM_ROT_MATRIX.copy()
-        self.head_robot2cam = HEAD_CAM_ROT_MATRIX_INV.copy()
-        self.head_pos_robot = HEAD_CAM_POS_ROBOT.copy()
+        self.K_ee = torch.tensor([
+            [EE_CAM['fx'], 0, EE_CAM['cx']],
+            [0, EE_CAM['fy'], EE_CAM['cy']],
+            [0, 0, 1],
+        ], dtype=torch.float32, device=self.device)
+
+        self.K_ee_inv = torch.inverse(self.K_ee)
+
+        # ---- end-effector camera 外参旋转矩阵 (预计算自 config.py) ----
+        ee_cam_mount = R.from_euler('xyz', EE_CAM_ROT_ROBOT).as_matrix().astype(np.float32)
+        ee_cam_axis = np.array([
+            [0,  0,  1],
+            [1,  0,  0],
+            [0, -1,  0],
+        ], dtype=np.float32)
+        self.ee_cam2robot = ee_cam_mount @ ee_cam_axis
+        self.ee_robot2cam = self.ee_cam2robot.T
+        self.ee_pos_robot = EE_CAM_POS_ROBOT.copy()
 
         # ---- 机器人里程计状态 ----
         self.robot_pos = ROBOT_INIT_POS.copy()
@@ -242,7 +272,7 @@ class PerceptionPipeline:
     # ==========================================================================
     def _detect(self, rgb_np):
         """
-        rgb_np: (480, 640, 3) uint8 numpy array (head camera)
+        rgb_np: (480, 640, 3) uint8 numpy array (end-effector camera)
         Returns: list of dict [{'bbox': [x1,y1,x2,y2], 'class_idx': int, 'conf': float}, ...]
         """
         results = self.detector(rgb_np, conf=YOLO_CONF_THRESHOLD, verbose=False)
@@ -266,10 +296,63 @@ class PerceptionPipeline:
 
         return detections
 
+    def _save_debug_visualization(self, rgb_np, detections, tracks, objects_list, target, head_rgb_np=None):
+        if not self.visualize or cv2 is None:
+            return
+
+        if rgb_np.ndim != 3 or rgb_np.shape[2] != 3:
+            return
+
+        rgb_bgr = cv2.cvtColor(rgb_np.copy(), cv2.COLOR_RGB2BGR)
+        if self.vis_show_rgb:
+            cv2.imshow("TaskB end-effector RGB", rgb_bgr)
+            if head_rgb_np is not None and head_rgb_np.ndim == 3 and head_rgb_np.shape[2] == 3:
+                head_bgr = cv2.cvtColor(head_rgb_np.copy(), cv2.COLOR_RGB2BGR)
+                cv2.imshow("TaskB head RGB", head_bgr)
+            cv2.waitKey(1)
+
+        if not self.vis_save_yolo or self.frame_count % self.vis_every != 0:
+            return
+
+        image = rgb_bgr.copy()
+        target_id = None if target is None else target.get('id')
+        object_by_id = {obj['id']: obj for obj in objects_list}
+
+        for det in detections:
+            x1, y1, x2, y2 = [int(v) for v in det['bbox']]
+            cls_name = CLASS_NAMES.get(det['class'], f"cls_{det['class']}")
+            label = f"det {cls_name} {det['conf']:.2f}"
+            cv2.rectangle(image, (x1, y1), (x2, y2), (80, 80, 80), 1)
+            cv2.putText(image, label, (x1, max(12, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1, cv2.LINE_AA)
+
+        for track in tracks:
+            x1, y1, x2, y2 = [int(v) for v in track['bbox']]
+            track_id = int(track['track_id'])
+            obj = object_by_id.get(track_id)
+            is_target = target_id == track_id
+            color = (0, 0, 255) if is_target else (0, 220, 0)
+            cls_name = CLASS_NAMES.get(track['class'], f"cls_{track['class']}")
+            dist = None if obj is None else obj.get('dist_to_robot')
+            pos_robot = None if obj is None else obj.get('pos_robot')
+            pos_text = ""
+            if pos_robot is not None:
+                pos_arr = np.asarray(pos_robot, dtype=np.float32)
+                pos_text = f" x={pos_arr[0]:.2f} y={pos_arr[1]:.2f}"
+            dist_text = "" if dist is None else f" d={float(dist):.2f}"
+            label = f"{'TARGET ' if is_target else ''}id={track_id} {cls_name}{dist_text}{pos_text}"
+
+            cv2.rectangle(image, (x1, y1), (x2, y2), color, 2 if is_target else 1)
+            cv2.putText(image, label, (x1, min(image.shape[0] - 6, y2 + 18)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+
+        status = f"frame={self.frame_count} detections={len(detections)} tracks={len(tracks)} objects={len(objects_list)} target={target_id}"
+        cv2.putText(image, status, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
+        filename = os.path.join(self.vis_dir, f"frame_{self.frame_count:06d}.jpg")
+        cv2.imwrite(filename, image)
+
     # ==========================================================================
     #  Step 2: 深度反投影 (像素 → 相机坐标系)
     # ==========================================================================
-    def _depth_to_cam(self, depth_np, bbox):
+    def _depth_to_cam(self, depth_np, bbox, cam_cfg=EE_CAM):
         """
         depth_np: (480, 640) float32 深度图 (米)
                   注意: Isaac Lab XYZCamera 输出的深度是沿光轴 (cam_Z) 的距离
@@ -280,10 +363,10 @@ class PerceptionPipeline:
         """
         x1, y1, x2, y2 = [int(v) for v in bbox]
         # clamp 到图像范围
-        x1 = max(0, min(x1, HEAD_CAM['width'] - 1))
-        x2 = max(x1 + 1, min(x2, HEAD_CAM['width']))
-        y1 = max(0, min(y1, HEAD_CAM['height'] - 1))
-        y2 = max(y1 + 1, min(y2, HEAD_CAM['height']))
+        x1 = max(0, min(x1, cam_cfg['width'] - 1))
+        x2 = max(x1 + 1, min(x2, cam_cfg['width']))
+        y1 = max(0, min(y1, cam_cfg['height'] - 1))
+        y2 = max(y1 + 1, min(y2, cam_cfg['height']))
 
         # 取 bbox 内 5×5 中心区域的深度中值（抗噪）
         cx = (x1 + x2) // 2
@@ -303,8 +386,8 @@ class PerceptionPipeline:
         # cam_Y = (v - cy) / fy * depth
         # cam_Z = depth (沿光轴)
         u, v = float(cx), float(cy)
-        x_cam = (u - HEAD_CAM['cx']) / HEAD_CAM['fx'] * depth
-        y_cam = (v - HEAD_CAM['cy']) / HEAD_CAM['fy'] * depth
+        x_cam = (u - cam_cfg['cx']) / cam_cfg['fx'] * depth
+        y_cam = (v - cam_cfg['cy']) / cam_cfg['fy'] * depth
         z_cam = depth
 
         return np.array([x_cam, y_cam, z_cam], dtype=np.float32)
@@ -313,28 +396,12 @@ class PerceptionPipeline:
     #  Step 3: 坐标变换链 (含俯仰角)
     # ==========================================================================
     def _cam_to_robot(self, p_cam):
-        """OpenCV 相机坐标系 → 机器人基座坐标系 (含 30° 俯仰角)
-        
-        p_cam = [cam_X, cam_Y, cam_Z] OpenCV 约定: 右, 下, 前(光轴)
-        
-        变换链:
-          1. 俯仰旋转 (绕 cam_X 轴, 负=朝下): R_x(pitch)
-          2. 轴交换: cam → robot: robot_X=cam_Z, robot_Y=cam_X, robot_Z=-cam_Y
-          3. 平移: + head_camera 在机器人基座上的偏移
-        
-        Returns: 机器人坐标系下坐标 [robot_X(前), robot_Y(右), robot_Z(上)]
-        """
-        # 使用预计算的旋转矩阵: p_robot_offset = cam2robot @ p_cam
-        p_robot_offset = self.head_cam2robot @ p_cam
-        p_robot = self.head_pos_robot + p_robot_offset
-        return p_robot
+        p_robot_offset = self.ee_cam2robot @ p_cam
+        return self.ee_pos_robot + p_robot_offset
 
-    # 反向: 机器人坐标系 → OpenCV 相机坐标系 (用于投影/验证)
     def _robot_to_cam(self, p_robot):
-        """机器人基座坐标系 → OpenCV 相机坐标系 (含俯仰角逆变换)"""
-        p_robot_offset = p_robot - self.head_pos_robot
-        p_cam = self.head_robot2cam @ p_robot_offset
-        return p_cam
+        p_robot_offset = p_robot - self.ee_pos_robot
+        return self.ee_robot2cam @ p_robot_offset
 
     def _robot_to_world(self, p_robot):
         """机器人基座坐标系 → 世界坐标系"""
@@ -469,8 +536,8 @@ class PerceptionPipeline:
             obs: dict, 来自 predicts() 的输入
                 {
                     'image': {
-                        'head_rgb':   (1, 480, 640, 3) torch uint8,
-                        'head_depth': (1, 480, 640, 1) torch float32,
+                        'ee_rgb':   (1, 480, 640, 3) torch uint8,
+                        'ee_depth': (1, 480, 640, 1) torch float32,
                     },
                     'proprio': (1, 72) torch,
                 }
@@ -482,19 +549,34 @@ class PerceptionPipeline:
         self.frame_count += 1
 
         # ---- 预处理输入 ----
-        head_rgb = obs['image']['head_rgb'].squeeze(0)
-        head_depth = obs['image']['head_depth'].squeeze(0).squeeze(-1)
+        image_obs = obs.get('image', {})
+        head_rgb = image_obs.get('head_rgb')
+        
+        # 优先使用 ee_rgb/ee_depth，如果不存在则回退到 head_rgb/head_depth
+        ee_rgb_key = 'ee_rgb' if 'ee_rgb' in image_obs else 'head_rgb'
+        ee_depth_key = 'ee_depth' if 'ee_depth' in image_obs else 'head_depth'
+        
+        ee_rgb = image_obs[ee_rgb_key].squeeze(0)
+        ee_depth = image_obs[ee_depth_key].squeeze(0).squeeze(-1)
         proprio = obs['proprio'].squeeze(0)
 
-        if head_rgb.device.type == 'cuda':
-            head_rgb_np = head_rgb.cpu().numpy().astype(np.uint8)
-        else:
-            head_rgb_np = head_rgb.numpy().astype(np.uint8)
+        head_rgb_np = None
+        if head_rgb is not None:
+            head_rgb = head_rgb.squeeze(0)
+            if head_rgb.device.type == 'cuda':
+                head_rgb_np = head_rgb.cpu().numpy().astype(np.uint8)
+            else:
+                head_rgb_np = head_rgb.numpy().astype(np.uint8)
 
-        if head_depth.device.type == 'cuda':
-            head_depth_np = head_depth.cpu().numpy().astype(np.float32)
+        if ee_rgb.device.type == 'cuda':
+            ee_rgb_np = ee_rgb.cpu().numpy().astype(np.uint8)
         else:
-            head_depth_np = head_depth.numpy().astype(np.float32)
+            ee_rgb_np = ee_rgb.numpy().astype(np.uint8)
+
+        if ee_depth.device.type == 'cuda':
+            ee_depth_np = ee_depth.cpu().numpy().astype(np.float32)
+        else:
+            ee_depth_np = ee_depth.numpy().astype(np.float32)
 
         if proprio.device.type == 'cuda':
             proprio_np = proprio.cpu().numpy().astype(np.float32)
@@ -505,7 +587,7 @@ class PerceptionPipeline:
         self._update_robot_pose(proprio_np, dt)
 
         # ---- YOLO 检测 ----
-        detections = self._detect(head_rgb_np)
+        detections = self._detect(ee_rgb_np)
 
         # ---- ByteTrack 追踪 ----
         tracks = self.tracker.update(detections)
@@ -523,7 +605,7 @@ class PerceptionPipeline:
             class_name = CLASS_NAMES.get(class_idx, f"cls_{class_idx}")
 
             # 深度 → 相机坐标 → 机器人坐标 → 世界坐标
-            p_cam = self._depth_to_cam(head_depth_np, bbox)
+            p_cam = self._depth_to_cam(ee_depth_np, bbox, EE_CAM)
             if p_cam is None:
                 continue
 
@@ -574,6 +656,7 @@ class PerceptionPipeline:
 
         # ---- 按距离排序 ----
         objects_list.sort(key=lambda x: x['dist_to_robot'])
+        self._save_debug_visualization(ee_rgb_np, detections, tracks, objects_list, target, head_rgb_np)
 
         # ---- 夹爪状态 ----
         gripper = self._read_gripper(proprio_np)

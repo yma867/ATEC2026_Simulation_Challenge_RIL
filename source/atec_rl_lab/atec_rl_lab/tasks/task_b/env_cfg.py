@@ -227,6 +227,16 @@ class TaskBEnvB2Cfg(TaskBEnvCfg):
             prim_path="{ENV_REGEX_NS}/Robot",
             init_state=UNITREE_B2_PIPER_CFG.init_state.replace(
                 pos=(-10, -10, 0.68),
+                joint_pos={
+                    **UNITREE_B2_PIPER_CFG.init_state.joint_pos,
+                    "arm_joint1": 0.0,
+                    "arm_joint2": 2.13,
+                    "arm_joint3": -1.20,
+                    "arm_joint4": 0.0,
+                    "arm_joint5": -0.8,
+                    "arm_joint6": 0.0,
+                    "arm_joint7": 0.0,
+                },
             )
         )
         super().__post_init__()
