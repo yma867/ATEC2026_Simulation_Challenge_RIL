@@ -1,7 +1,13 @@
 import math
 import os
 import sys
+import time
 from typing import Any
+
+try:
+    import cv2
+except Exception:
+    cv2 = None
 
 import numpy as np
 import torch
@@ -13,50 +19,21 @@ PERCEPTION_DIR = os.path.join(REPO_ROOT, "taskb_perception")
 if os.path.isdir(PERCEPTION_DIR) and PERCEPTION_DIR not in sys.path:
     sys.path.insert(0, PERCEPTION_DIR)
 
-try:
-    from config import BIN_CENTER, ROBOT_INIT_POS, ROBOT_INIT_YAW
-except Exception:
-    BIN_CENTER = np.array([-3.0, -10.0, 0.0], dtype=np.float32)
-    ROBOT_INIT_POS = np.array([-10.0, -10.0, 0.68], dtype=np.float32)
-    ROBOT_INIT_YAW = 0.0
+# 强制导入 taskb_perception 模块，不使用回退
+from config import BIN_CENTER, ROBOT_INIT_POS, ROBOT_INIT_YAW
+from rgbd_pure_dual_pipeline import RgbdPureDualPipeline
+from rgbd_utils import depth_to_vis, parse_ee_rgbd, parse_head_rgbd, depth_stats
 
 try:
-    from perception_pipeline import PerceptionPipeline
+    from .solution_gt import ArmGraspController
 except Exception:
-    PerceptionPipeline = None
+    from solution_gt import ArmGraspController
 
-try:
-    from atec_rl_lab.assets.robots.b2 import UNITREE_B2_PIPER_CFG
+from atec_rl_lab.assets.robots.b2 import UNITREE_B2_PIPER_CFG
 
-    B2_PIPER_LEG_JOINT_NAMES = list(UNITREE_B2_PIPER_CFG.leg_joint_names)
-    B2_PIPER_ARM_JOINT_NAMES = list(UNITREE_B2_PIPER_CFG.arm_joint_names)
-    B2_PIPER_TOTAL_JOINT_NAMES = list(UNITREE_B2_PIPER_CFG.joint_names)
-except Exception:
-    B2_PIPER_LEG_JOINT_NAMES = [
-        "FR_hip_joint",
-        "FR_thigh_joint",
-        "FR_calf_joint",
-        "FL_hip_joint",
-        "FL_thigh_joint",
-        "FL_calf_joint",
-        "RR_hip_joint",
-        "RR_thigh_joint",
-        "RR_calf_joint",
-        "RL_hip_joint",
-        "RL_thigh_joint",
-        "RL_calf_joint",
-    ]
-    B2_PIPER_ARM_JOINT_NAMES = [
-        "arm_joint1",
-        "arm_joint2",
-        "arm_joint3",
-        "arm_joint4",
-        "arm_joint5",
-        "arm_joint6",
-        "arm_joint7",
-        "arm_joint8",
-    ]
-    B2_PIPER_TOTAL_JOINT_NAMES = B2_PIPER_LEG_JOINT_NAMES + B2_PIPER_ARM_JOINT_NAMES
+B2_PIPER_LEG_JOINT_NAMES = list(UNITREE_B2_PIPER_CFG.leg_joint_names)
+B2_PIPER_ARM_JOINT_NAMES = list(UNITREE_B2_PIPER_CFG.arm_joint_names)
+B2_PIPER_TOTAL_JOINT_NAMES = list(UNITREE_B2_PIPER_CFG.joint_names)
 
 
 class B2PiperActor(nn.Module):
@@ -77,12 +54,13 @@ class B2PiperActor(nn.Module):
 
 
 class AlgSolution:
-    def __init__(self):
+    def __init__(self, env=None):
+        self.env = env
         self.device_str = "cuda:0" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(self.device_str)
+        self.camera_follow_enabled = os.getenv("ATEC_TASKB_CAMERA_FOLLOW", "1").lower() in {"1", "true", "yes", "on"}
         self.nav_debug = os.getenv("ATEC_TASKB_NAV_DEBUG", "1").lower() in {"1", "true", "yes", "on"}
         self.nav_debug_every = max(1, int(os.getenv("ATEC_TASKB_NAV_DEBUG_EVERY", "25")))
-        self.use_perception = os.getenv("ATEC_TASKB_USE_PERCEPTION", "1").lower() in {"1", "true", "yes", "on"}
         self.target_mode = os.getenv("ATEC_TASKB_TARGET_MODE", "object").lower()
         self._nav_debug_step = 0
         self._step_count = 0
@@ -90,6 +68,25 @@ class AlgSolution:
         self._odom_pos = np.asarray(ROBOT_INIT_POS, dtype=np.float32).copy()
         self._odom_yaw = float(ROBOT_INIT_YAW)
         self._last_base_cmd = np.zeros(3, dtype=np.float32)
+        self._last_nav_info: dict[str, Any] = {}
+        self._last_perception_output: dict[str, Any] | None = None
+        self._locked_target: dict[str, Any] | None = None
+        self._pending_target: dict[str, Any] | None = None
+        self._tracked_target: dict[str, Any] | None = None
+        self._last_known_target_pos: list[float] | None = None
+        self._target_lost_count = 0
+        self._task_state = "APPROACH_OBJECT"
+        self._pending_grasp_target: dict[str, Any] | None = None
+        self._locked_goal_xy: np.ndarray | None = None
+        self._locked_goal_yaw: float | None = None
+        self._locked_goal_target_id: Any | None = None
+        self._locked_target_world: list[float] | None = None
+        self._release_step_count = 0
+        self._arm_grasp_controller = None
+        self._arm_controller_init_failed = False
+
+        # 初始化日志系统
+        self._log_file_path = self._init_logging()
 
         self.checkpoint_path = os.path.join(
             REPO_ROOT,
@@ -102,7 +99,8 @@ class AlgSolution:
         if not os.path.exists(self.checkpoint_path):
             raise FileNotFoundError(f"Missing checkpoint: {self.checkpoint_path}")
 
-        self.perception = PerceptionPipeline(device=self.device_str) if self.use_perception and PerceptionPipeline is not None else None
+        # 强制初始化感知管道，不使用回退
+        self.perception = RgbdPureDualPipeline()
 
         checkpoint = torch.load(self.checkpoint_path, map_location="cpu")
         state_dict = checkpoint["model_state_dict"]
@@ -126,10 +124,8 @@ class AlgSolution:
             dtype=torch.float32,
         ).view(1, -1)
         self.leg_action_scale_inv = torch.reciprocal(self.leg_action_scale)
-        
-        # Define default arm joint positions for known robots
-        # This matches the configuration in env_cfg.py for TaskB B2Piper
-        b2_piper_arm_defaults = {
+
+        arm_default_pos = {
             "arm_joint1": 0.0,
             "arm_joint2": 2.13,
             "arm_joint3": -1.20,
@@ -139,12 +135,8 @@ class AlgSolution:
             "arm_joint7": 0.0,
             "arm_joint8": 0.0,
         }
-        
-        # Build arm default action vector, fallback to 0.0 for unknown joints
-        arm_default_pos = [b2_piper_arm_defaults.get(name, 0.0) for name in self.arm_joint_names]
-        
         self.arm_default_action = torch.tensor(
-            arm_default_pos,
+            [arm_default_pos.get(name, 0.0) for name in self.arm_joint_names],
             device=self.device,
             dtype=torch.float32,
         ).view(1, -1)
@@ -155,23 +147,151 @@ class AlgSolution:
                 f"expected input=45, output={self.leg_action_dim}"
             )
 
-        self.stand_still_steps = max(0, int(float(os.getenv("ATEC_TASKB_STAND_SECONDS", "2.0")) / 0.02))
+        self.stand_still_steps = max(0, int(float(os.getenv("ATEC_TASKB_STAND_SECONDS", "1.5")) / 0.02))
         self.stop_distance = float(os.getenv("ATEC_TASKB_STOP_DISTANCE", "0.9"))
         self.object_stop_distance = float(os.getenv("ATEC_TASKB_OBJECT_STOP_DISTANCE", "0.7"))
         self.stop_tolerance = float(os.getenv("ATEC_TASKB_STOP_TOLERANCE", "0.2"))
         self.object_stop_tolerance = float(os.getenv("ATEC_TASKB_OBJECT_STOP_TOLERANCE", "0.15"))
+        self.object_lateral_tolerance = float(
+            os.getenv("ATEC_TASKB_OBJECT_LATERAL_TOLERANCE", str(self.object_stop_tolerance))
+        )
+        self.object_forward_tolerance = float(
+            os.getenv("ATEC_TASKB_OBJECT_FORWARD_TOLERANCE", str(self.object_stop_tolerance))
+        )
         self.object_yaw_tolerance = float(os.getenv("ATEC_TASKB_OBJECT_YAW_TOLERANCE", "0.15"))
         self.slow_down_radius = float(os.getenv("ATEC_TASKB_SLOW_DOWN_RADIUS", "1.5"))
         self.max_lin_vel = float(os.getenv("ATEC_TASKB_MAX_LIN_VEL", "0.8"))
         self.max_lat_vel = float(os.getenv("ATEC_TASKB_MAX_LAT_VEL", "0.4"))
-        self.max_ang_vel = float(os.getenv("ATEC_TASKB_MAX_ANG_VEL", "0.8"))
+        self.max_ang_vel = float(os.getenv("ATEC_TASKB_MAX_ANG_VEL", "0.6"))
         self.heading_kp = float(os.getenv("ATEC_TASKB_HEADING_KP", "1.2"))
         self.min_heading_lin_scale = float(os.getenv("ATEC_TASKB_MIN_HEADING_LIN_SCALE", "0.25"))
+        self.max_target_distance = float(os.getenv("ATEC_TASKB_MAX_TARGET_DISTANCE", "6.0"))
+        self.min_target_distance = float(os.getenv("ATEC_TASKB_MIN_TARGET_DISTANCE", "0.15"))
+        self.min_target_conf = float(os.getenv("ATEC_TASKB_MIN_TARGET_CONF", "0.0"))
+        self.target_reacquire_radius = float(os.getenv("ATEC_TASKB_TARGET_REACQUIRE_RADIUS", "0.45"))
+        self.target_lock_timeout_steps = max(1, int(os.getenv("ATEC_TASKB_TARGET_LOCK_TIMEOUT_STEPS", "45")))
+        self.target_confirm_steps = max(1, int(os.getenv("ATEC_TASKB_TARGET_CONFIRM_STEPS", "5")))
+        self.target_head_confirm_steps = max(1, int(os.getenv("ATEC_TASKB_TARGET_HEAD_CONFIRM_STEPS", "3")))
+        self.target_pending_timeout_steps = max(1, int(os.getenv("ATEC_TASKB_TARGET_PENDING_TIMEOUT_STEPS", "12")))
+        self.target_far_match_radius = float(os.getenv("ATEC_TASKB_TARGET_FAR_MATCH_RADIUS", "0.60"))
+        self.target_near_match_radius = float(os.getenv("ATEC_TASKB_TARGET_NEAR_MATCH_RADIUS", "0.25"))
+        self.target_pending_match_radius = float(os.getenv("ATEC_TASKB_TARGET_PENDING_MATCH_RADIUS", "0.35"))
+        self.target_ema_alpha_ee = float(os.getenv("ATEC_TASKB_TARGET_EMA_ALPHA_EE", "0.25"))
+        self.target_ema_alpha_head = float(os.getenv("ATEC_TASKB_TARGET_EMA_ALPHA_HEAD", "0.45"))
+        self.target_near_range = float(os.getenv("ATEC_TASKB_TARGET_NEAR_RANGE", "1.80"))
+        self.target_freeze_distance = float(os.getenv("ATEC_TASKB_TARGET_FREEZE_DISTANCE", "1.20"))
+        self.target_relock_disagreement = float(os.getenv("ATEC_TASKB_TARGET_RELOCK_DISAGREEMENT", "0.60"))
+        self.turn_then_go_yaw_threshold = float(os.getenv("ATEC_TASKB_TURN_THEN_GO_YAW_THRESHOLD", "0.30"))
+        self.turn_then_go_heading_hold = float(os.getenv("ATEC_TASKB_TURN_THEN_GO_HEADING_HOLD", "0.18"))
+        self.dynamic_stop_distance_far = float(os.getenv("ATEC_TASKB_DYNAMIC_STOP_DISTANCE_FAR", "1.15"))
+        self.dynamic_stop_distance_near = float(os.getenv("ATEC_TASKB_DYNAMIC_STOP_DISTANCE_NEAR", "0.82"))
+        self.dynamic_lateral_gain = float(os.getenv("ATEC_TASKB_DYNAMIC_LATERAL_GAIN", "0.60"))
+        self.search_yaw_rate = float(os.getenv("ATEC_TASKB_SEARCH_YAW_RATE", "0.35"))
+        self.grasp_start_depth = float(os.getenv("ATEC_TASKB_GRASP_START_DEPTH", "1.10"))
+        self.bin_drop_radius = float(os.getenv("ATEC_TASKB_BIN_DROP_RADIUS", "1.0"))
+        self.release_steps = max(1, int(os.getenv("ATEC_TASKB_RELEASE_STEPS", "25")))
         self.default_bin_center = np.asarray(BIN_CENTER, dtype=np.float32)
         self.dt = 0.02
+        self.arm_action_scale = 0.5
+        self.arm_ik_joint_names = list(self.arm_joint_names[:6])
+        self.gripper_joint_names = list(self.arm_joint_names[6:])
+
+        self.show_rgb = os.getenv("ATEC_SHOW_RGB", "1").lower() in {"1", "true", "yes", "on"}
+        self.rgb_debug_every = max(1, int(os.getenv("ATEC_SHOW_RGB_EVERY", "50")))
+        self._rgb_debug_failed = False
+        self._rgb_debug_warned = False
+
+        self.save_rgb = os.getenv("ATEC_SAVE_RGB", "1").lower() in {"1", "true", "yes", "on"}
+        self.save_rgb_dir = os.path.join(REPO_ROOT, "logs", "rgb_frames")
+        os.makedirs(self.save_rgb_dir, exist_ok=True)
+        self._rgb_save_warned = False
+
+    def _init_logging(self) -> str:
+        log_dir = os.path.join(REPO_ROOT, "logs", "solution_rl")
+        os.makedirs(log_dir, exist_ok=True)
+        timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+        log_file_path = os.path.join(log_dir, f"solution_rl_{timestamp}.log")
+        print(f"Log file: {log_file_path}", flush=True)
+        return log_file_path
+
+    def _log(self, message: str) -> None:
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        log_line = f"[{timestamp}] {message}\n"
+        with open(self._log_file_path, "a") as f:
+            f.write(log_line)
+
+    def reset(self, **_: Any) -> None:
+        self._nav_debug_step = 0
+        self._step_count = 0
+        self._perception_error_printed = False
+        self._odom_pos = np.asarray(ROBOT_INIT_POS, dtype=np.float32).copy()
+        self._odom_yaw = float(ROBOT_INIT_YAW)
+        self._last_base_cmd = np.zeros(3, dtype=np.float32)
+        self._last_policy_action = np.zeros(3, dtype=np.float32)
+        self._last_nav_info = {}
+        self._last_perception_output = None
+        self._locked_target = None
+        self._pending_target = None
+        self._tracked_target = None
+        self._last_known_target_pos = None
+        self._target_lost_count = 0
+        self._task_state = "APPROACH_OBJECT"
+        self._pending_grasp_target = None
+        self._locked_goal_xy = None
+        self._locked_goal_yaw = None
+        self._locked_goal_target_id = None
+        self._locked_target_world = None
+        self._release_step_count = 0
+        if self._arm_grasp_controller is not None:
+            self._arm_grasp_controller.reset()
+        if self.perception is not None and hasattr(self.perception, "reset"):
+            self.perception.reset()
 
     def get_action_spec(self) -> dict[str, dict[str, Any]] | None:
         return None
+
+    def _get_scene(self):
+        if self.env is None:
+            return None
+        env_unwrapped = self.env.unwrapped if hasattr(self.env, "unwrapped") else self.env
+        if hasattr(env_unwrapped, "scene"):
+            return env_unwrapped.scene
+        if hasattr(env_unwrapped, "_env") and hasattr(env_unwrapped._env, "scene"):
+            return env_unwrapped._env.scene
+        return None
+
+    def _get_robot(self):
+        scene = self._get_scene()
+        if scene is None:
+            return None
+        try:
+            robot = scene["robot"]
+        except Exception:
+            return None
+        if isinstance(robot, (list, tuple)):
+            robot = robot[0] if robot else None
+        return robot
+
+    def _ensure_arm_grasp_controller(self):
+        if self._arm_grasp_controller is not None or self._arm_controller_init_failed or ArmGraspController is None:
+            return self._arm_grasp_controller
+        robot = self._get_robot()
+        if robot is None:
+            return None
+        try:
+            self._arm_grasp_controller = ArmGraspController(
+                robot=robot,
+                device=self.device,
+                arm_joint_names=self.arm_ik_joint_names,
+                gripper_joint_names=self.gripper_joint_names,
+                ee_body_name="gripper_base",
+                action_scale=self.arm_action_scale,
+            )
+        except Exception as exc:
+            self._arm_controller_init_failed = True
+            self._log(f"[TaskB-GRASP] controller init failed: {type(exc).__name__}: {exc}")
+            self._arm_grasp_controller = None
+        return self._arm_grasp_controller
 
     @staticmethod
     def _wrap_angle(angle: float) -> float:
@@ -179,12 +299,81 @@ class AlgSolution:
 
     @staticmethod
     def _safe_numpy(vector, fallback: np.ndarray) -> np.ndarray:
-        arr = np.asarray(vector if vector is not None else fallback, dtype=np.float32)
-        if arr.shape[0] < 3:
+        base = fallback if vector is None else vector
+        arr = np.asarray(base, dtype=np.float32).reshape(-1)
+        if arr.size < 3:
             padded = np.zeros(3, dtype=np.float32)
-            padded[: arr.shape[0]] = arr
+            padded[: arr.size] = arr
             arr = padded
         return np.nan_to_num(arr[:3], nan=0.0, posinf=0.0, neginf=0.0)
+
+    @staticmethod
+    def _safe_float(value: Any, fallback: float = 0.0) -> float:
+        try:
+            scalar = float(value)
+        except (TypeError, ValueError):
+            return fallback
+        if not np.isfinite(scalar):
+            return fallback
+        return scalar
+
+    @staticmethod
+    def _tensor_to_numpy(data: Any) -> np.ndarray | None:
+        if data is None:
+            return None
+        if isinstance(data, torch.Tensor):
+            data = data.detach()
+            if data.device.type == "cuda":
+                data = data.cpu()
+            data = data.numpy()
+        return np.asarray(data)
+
+    @staticmethod
+    def _get_nested(mapping: Any, *path: str) -> Any:
+        current = mapping
+        for key in path:
+            if not isinstance(current, dict) or key not in current:
+                return None
+            current = current[key]
+        return current
+
+    def _world_to_robot_frame(
+        self,
+        point_world: np.ndarray,
+        robot_pos_world: np.ndarray,
+        robot_yaw: float,
+    ) -> np.ndarray:
+        delta = self._safe_numpy(point_world, np.zeros(3, dtype=np.float32)) - self._safe_numpy(
+            robot_pos_world, np.zeros(3, dtype=np.float32)
+        )
+        cos_yaw = math.cos(robot_yaw)
+        sin_yaw = math.sin(robot_yaw)
+        return np.array(
+            [
+                cos_yaw * delta[0] + sin_yaw * delta[1],
+                -sin_yaw * delta[0] + cos_yaw * delta[1],
+                delta[2],
+            ],
+            dtype=np.float32,
+        )
+
+    def _robot_to_world_frame(
+        self,
+        point_robot: np.ndarray,
+        robot_pos_world: np.ndarray,
+        robot_yaw: float,
+    ) -> np.ndarray:
+        point_robot = self._safe_numpy(point_robot, np.zeros(3, dtype=np.float32))
+        cos_yaw = math.cos(robot_yaw)
+        sin_yaw = math.sin(robot_yaw)
+        return self._safe_numpy(robot_pos_world, np.zeros(3, dtype=np.float32)) + np.array(
+            [
+                cos_yaw * point_robot[0] - sin_yaw * point_robot[1],
+                sin_yaw * point_robot[0] + cos_yaw * point_robot[1],
+                point_robot[2],
+            ],
+            dtype=np.float32,
+        )
 
     def _update_local_odometry(self, obs: dict[str, Any]) -> dict[str, Any]:
         proprio = torch.as_tensor(obs["proprio"], device="cpu", dtype=torch.float32).squeeze(0).numpy()
@@ -208,62 +397,1145 @@ class AlgSolution:
             "robot": {
                 "pos_world": self._odom_pos.tolist(),
                 "yaw": float(self._odom_yaw),
+                "pose_source": "local_odometry",
             },
             "bin": {
                 "center_world": self.default_bin_center.tolist(),
             },
         }
 
-    def _select_target(self, perception_output: dict[str, Any]) -> dict[str, Any] | None:
-        target = perception_output.get("target")
-        if target is not None:
-            return target
+    def _resolve_robot_pose_world(
+        self,
+        obs: dict[str, Any],
+        local_nav: dict[str, Any],
+        perception_output: dict[str, Any] | None,
+    ) -> tuple[np.ndarray, float, str]:
+        # 直接使用环境中的 ground truth 机器人位姿，不回退
+        gt_pose = self._get_ground_truth_robot_pose()
+        if gt_pose is not None:
+            return gt_pose
+        
+        # 如果获取失败，返回初始位置（不应该发生）
+        self._log("[WARNING] Failed to get ground truth robot pose, using initial position")
+        return np.asarray(ROBOT_INIT_POS, dtype=np.float32).copy(), float(ROBOT_INIT_YAW), "robot_init"
 
-        objects = perception_output.get("objects_detailed") or perception_output.get("objects_remaining") or []
-        candidates = []
+    def _get_ground_truth_robot_pose(self) -> tuple[np.ndarray, float, str] | None:
+        """从环境中获取真实的机器人位姿（参考 solution_gt）"""
+        if self.env is None:
+            return None
+        
+        try:
+            env_unwrapped = self.env.unwrapped if hasattr(self.env, 'unwrapped') else self.env
+            scene = None
+            
+            if hasattr(env_unwrapped, 'scene'):
+                scene = env_unwrapped.scene
+            elif hasattr(env_unwrapped, '_env') and hasattr(env_unwrapped._env, 'scene'):
+                scene = env_unwrapped._env.scene
+            
+            if scene is None:
+                return None
+            
+            # 直接尝试获取 robot
+            try:
+                robot = scene['robot']
+            except KeyError:
+                return None
+            
+            # 处理 scene['robot'] 返回数组的情况
+            if isinstance(robot, (list, tuple)):
+                robot = robot[0]
+            
+            if not (hasattr(robot, 'data') and hasattr(robot.data, 'root_pos_w')):
+                return None
+            
+            if not (hasattr(robot, 'data') and hasattr(robot.data, 'root_quat_w')):
+                return None
+            
+            # 获取真实位置
+            pos_world = robot.data.root_pos_w.cpu().numpy()[0]
+            pos_world = np.array(pos_world, dtype=np.float32)
+            pos_world[2] = 0.68  # 保持高度不变
+            
+            # 从四元数提取 yaw（Isaac Sim 使用 w, x, y, z 格式）
+            quat = robot.data.root_quat_w.cpu().numpy()[0]
+            w, x, y, z = quat[0], quat[1], quat[2], quat[3]
+            siny_cosp = 2 * (w * z + x * y)
+            cosy_cosp = 1 - 2 * (y * y + z * z)
+            yaw = float(math.atan2(siny_cosp, cosy_cosp))
+            
+            return pos_world, yaw, "ground_truth"
+        except Exception:
+            # 如果获取失败，返回 None 让其他方法处理
+            return None
+
+    def _get_ground_truth_camera_pose(self, camera_name: str) -> tuple[np.ndarray, np.ndarray] | None:
+        """从环境中获取相机的真实世界位姿"""
+        if self.env is None:
+            return None
+
+        try:
+            env_unwrapped = self.env.unwrapped if hasattr(self.env, 'unwrapped') else self.env
+            scene = None
+
+            if hasattr(env_unwrapped, 'scene'):
+                scene = env_unwrapped.scene
+            elif hasattr(env_unwrapped, '_env') and hasattr(env_unwrapped._env, 'scene'):
+                scene = env_unwrapped._env.scene
+
+            if scene is None:
+                return None
+
+            candidate_names = [
+                camera_name,
+                f"{camera_name}_camera",
+                "camera_front",
+                "camera_ee",
+                "eye_camera",
+                "rgbd_camera",
+                "camera_0",
+                "camera_top",
+                "head_camera",
+                "camera_head",
+            ]
+
+            found = None
+            for name in candidate_names:
+                try:
+                    cam_obj = scene[name]
+                    if isinstance(cam_obj, (list, tuple)):
+                        cam_obj = cam_obj[0]
+                    if hasattr(cam_obj, 'data') and hasattr(cam_obj.data, 'root_pos_w'):
+                        found = (name, cam_obj)
+                        break
+                except (KeyError, IndexError):
+                    continue
+
+            if found is None:
+                available = []
+                for key in list(scene.keys())[:50]:
+                    val = scene[key]
+                    if isinstance(val, (list, tuple)) and len(val) > 0:
+                        val = val[0]
+                    if hasattr(val, 'data') and hasattr(val.data, 'root_pos_w'):
+                        available.append(key)
+                if not self._perception_error_printed and self._step_count % 30 == 0:
+                    self._log(f"[CAM] camera '{camera_name}' not found. Available: {available}")
+                return None
+
+            name, cam_obj = found
+            pos_world = np.array(cam_obj.data.root_pos_w.cpu().numpy()[0], dtype=np.float32)
+            quat = cam_obj.data.root_quat_w.cpu().numpy()[0]
+            w, x, y, z = float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])
+            rot_matrix = self._quat_to_rot_matrix(w, x, y, z)
+
+            if self._step_count % 60 == 0:
+                # Compute camera-frame forward vector in world frame
+                forward_world = rot_matrix @ np.array([0.0, 0.0, 1.0], dtype=np.float32)
+                self._log(
+                    f"[CAM] '{name}' pos=[{pos_world[0]:.2f}, {pos_world[1]:.2f}, {pos_world[2]:.2f}] "
+                    f"fwd=[{forward_world[0]:+.3f}, {forward_world[1]:+.3f}, {forward_world[2]:+.3f}]"
+                )
+            return pos_world, rot_matrix
+        except Exception as exc:
+            if not self._perception_error_printed and self._step_count % 30 == 0:
+                self._log(f"[CAM] camera '{camera_name}' error: {type(exc).__name__}: {exc}")
+            return None
+
+    def _quat_to_rot_matrix(self, w: float, x: float, y: float, z: float) -> np.ndarray:
+        """将四元数 (w, x, y, z) 转换为旋转矩阵"""
+        xx = x * x
+        yy = y * y
+        zz = z * z
+        wx = w * x
+        wy = w * y
+        wz = w * z
+        xy = x * y
+        xz = x * z
+        yz = y * z
+        
+        rot = np.array([
+            [1 - 2*yy - 2*zz, 2*xy - 2*wz,   2*xz + 2*wy],
+            [2*xy + 2*wz,   1 - 2*xx - 2*zz, 2*yz - 2*wx],
+            [2*xz - 2*wy,   2*yz + 2*wx,   1 - 2*xx - 2*yy]
+        ], dtype=np.float32)
+        
+        return rot
+
+    def _prepare_pipeline_object(
+        self,
+        obj: dict[str, Any] | None,
+        source_camera: str,
+        robot_pos_world: np.ndarray,
+        robot_yaw: float,
+    ) -> dict[str, Any] | None:
+        if not isinstance(obj, dict):
+            return None
+        out = dict(obj)
+        out["source_camera"] = source_camera
+        out["camera"] = source_camera
+
+        pos_robot = out.get("pos_robot")
+        pos_world = out.get("pos_world")
+        if pos_robot is not None:
+            pos_robot_np = self._safe_numpy(pos_robot, np.zeros(3, dtype=np.float32))
+        elif pos_world is not None:
+            pos_robot_np = self._world_to_robot_frame(pos_world, robot_pos_world, robot_yaw)
+            out["pos_robot"] = pos_robot_np.tolist()
+        else:
+            pos_robot_np = None
+
+        if pos_robot_np is not None:
+            pos_world_np = self._robot_to_world_frame(pos_robot_np, robot_pos_world, robot_yaw)
+            out["pos_world"] = pos_world_np.tolist()
+        elif pos_world is not None:
+            pos_world_np = self._safe_numpy(pos_world, np.zeros(3, dtype=np.float32))
+        else:
+            pos_world_np = None
+
+        if pos_robot_np is not None:
+            out["dist_to_robot"] = self._safe_float(out.get("dist_to_robot"), float(np.linalg.norm(pos_robot_np[:2])))
+            out["yaw_rel"] = self._safe_float(out.get("yaw_rel"), float(math.atan2(pos_robot_np[1], pos_robot_np[0])))
+        return out
+
+    def _collect_pipeline_objects(
+        self,
+        perception_output: dict[str, Any] | None,
+        robot_pos_world: np.ndarray,
+        robot_yaw: float,
+    ) -> list[dict[str, Any]]:
+        if not isinstance(perception_output, dict):
+            return []
+        collected: list[dict[str, Any]] = []
+        for camera_key, source_camera in (("ee_objects", "ee"), ("head_objects", "head")):
+            for obj in perception_output.get(camera_key, []) or []:
+                prepared = self._prepare_pipeline_object(obj, source_camera, robot_pos_world, robot_yaw)
+                if prepared is not None:
+                    collected.append(prepared)
+        return collected
+
+    def _get_perception_output(
+        self,
+        obs: dict[str, Any],
+        local_nav: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, np.ndarray, float, str]:
+        perception_output = None
+        
+        # # 添加数据检查（调试用，已注释）
+        # image_obs = obs.get("image", {})
+        # ee_rgb_raw = image_obs.get("ee_rgb")
+        # ee_depth_raw = image_obs.get("ee_depth")
+        # 
+        # if self._step_count % 30 == 0:
+        #     if ee_rgb_raw is not None:
+        #         if hasattr(ee_rgb_raw, 'shape'):
+        #             print(f"[SolutionRL] Raw ee_rgb shape: {ee_rgb_raw.shape}", flush=True)
+        #         else:
+        #             print(f"[SolutionRL] Raw ee_rgb type: {type(ee_rgb_raw)}", flush=True)
+        #     if ee_depth_raw is not None:
+        #         if hasattr(ee_depth_raw, 'shape'):
+        #             print(f"[SolutionRL] Raw ee_depth shape: {ee_depth_raw.shape}", flush=True)
+        #         else:
+        #             print(f"[SolutionRL] Raw ee_depth type: {type(ee_depth_raw)}", flush=True)
+        
+        gt_pose = self._get_ground_truth_robot_pose()
+        gt_pos = gt_pose[0] if gt_pose is not None else None
+        gt_yaw = gt_pose[1] if gt_pose is not None else None
+        try:
+            perception_output = self.perception.process(obs, dt=self.dt, gt_robot_pos=gt_pos, gt_robot_yaw=gt_yaw)
+            
+            # 使用相机真实位姿校正 EE 相机物体位置
+            self._correct_ee_camera_objects(perception_output, gt_pos, gt_yaw)
+            
+        except Exception as exc:
+            if not self._perception_error_printed:
+                self._log(f"[TaskB-PERCEPTION] disabled after error: {type(exc).__name__}: {exc}")
+                self._perception_error_printed = True
+            perception_output = None
+        robot_pos_world, robot_yaw, pose_source = self._resolve_robot_pose_world(obs, local_nav, perception_output)
+        return perception_output, robot_pos_world, robot_yaw, pose_source
+
+    def _correct_ee_camera_objects(self, perception_output: dict, robot_pos: np.ndarray, robot_yaw: float) -> None:
+        """使用相机真实位姿校正物体位置 (EE + head)"""
+        if perception_output is None:
+            return
+
+        # Camera intrinsic parameters
+        EE_INTR = (458.29, 458.29, 320.0, 240.0)
+        HEAD_INTR = (733.27, 733.27, 320.0, 240.0)
+
+        corrected_any = False
+
+        # 获取 EE 相机真实位姿并校正
+        ee_cam_pose = self._get_ground_truth_camera_pose("ee_camera")
+        if ee_cam_pose is not None:
+            ee_cam_pos_w, ee_cam_rot_w = ee_cam_pose
+            ee_objects = perception_output.get("ee_objects", [])
+            n_before = len(ee_objects)
+            self._correct_objects_with_camera_pose(ee_objects, ee_cam_pos_w, ee_cam_rot_w, EE_INTR, robot_pos, robot_yaw)
+            target_nav = perception_output.get("target_nav")
+            if isinstance(target_nav, dict):
+                self._correct_object_with_camera_pose(target_nav, ee_cam_pos_w, ee_cam_rot_w, *EE_INTR, robot_pos, robot_yaw)
+            target_grasp = perception_output.get("target_grasp")
+            if isinstance(target_grasp, dict):
+                src = str(target_grasp.get("source") or target_grasp.get("camera") or "")
+                head_objs = perception_output.get("head_objects", [])
+                is_from_head = "head" in src.lower() or target_grasp in head_objs
+                if not is_from_head:
+                    self._correct_object_with_camera_pose(target_grasp, ee_cam_pos_w, ee_cam_rot_w, *EE_INTR, robot_pos, robot_yaw)
+            corrected_any = True
+            if self._step_count % 60 == 0:
+                pw = ee_cam_pos_w
+                self._log(f"[CORR] EE camera correction applied, {n_before} objects at pos=[{pw[0]:.2f}, {pw[1]:.2f}, {pw[2]:.2f}]")
+
+        # 获取 head 相机真实位姿并校正 head 检测物体
+        head_cam_pose = self._get_ground_truth_camera_pose("head_camera")
+        if head_cam_pose is not None:
+            head_cam_pos_w, head_cam_rot_w = head_cam_pose
+            head_objects = perception_output.get("head_objects", [])
+            self._correct_objects_with_camera_pose(head_objects, head_cam_pos_w, head_cam_rot_w, HEAD_INTR, robot_pos, robot_yaw)
+            target_grasp = perception_output.get("target_grasp")
+            if isinstance(target_grasp, dict):
+                src = str(target_grasp.get("source") or target_grasp.get("camera") or "")
+                head_objs = perception_output.get("head_objects", [])
+                is_from_head = "head" in src.lower() or target_grasp in head_objs
+                if is_from_head:
+                    self._correct_object_with_camera_pose(target_grasp, head_cam_pos_w, head_cam_rot_w, *HEAD_INTR, robot_pos, robot_yaw)
+            corrected_any = True
+            if self._step_count % 60 == 0:
+                pw = head_cam_pos_w
+                self._log(f"[CORR] HEAD camera correction applied at pos=[{pw[0]:.2f}, {pw[1]:.2f}, {pw[2]:.2f}]")
+
+        # Log one corrected target's pos_world for debugging
+        if corrected_any and self._step_count % 60 == 0:
+            target_nav = perception_output.get("target_nav")
+            if isinstance(target_nav, dict):
+                pw = target_nav.get("pos_world")
+                dr = target_nav.get("dist_to_robot")
+                if pw is not None:
+                    self._log(
+                        f"[CORR] target_nav pos_w=[{pw[0]:.2f}, {pw[1]:.2f}, {pw[2]:.2f}] "
+                        f"dist_to_robot={dr:.2f}m"
+                    )
+
+    def _correct_objects_with_camera_pose(
+        self,
+        objects: list,
+        cam_pos_w: np.ndarray,
+        cam_rot_w: np.ndarray,
+        fx_fy_cx_cy: tuple,
+        robot_pos: np.ndarray,
+        robot_yaw: float,
+    ) -> None:
+        """批量校正物体位置"""
+        fx, fy, cx, cy = fx_fy_cx_cy
         for obj in objects:
-            if obj.get("in_bin", False):
-                continue
-            pos_robot = obj.get("pos_robot")
-            if pos_robot is None:
-                continue
-            pos = self._safe_numpy(pos_robot, np.zeros(3, dtype=np.float32))
-            if pos[0] <= 0.05:
-                continue
-            dist = float(obj.get("dist_to_robot", obj.get("dist", np.linalg.norm(pos[:2]))))
-            if np.isfinite(dist):
-                candidates.append((dist, obj))
+            self._correct_object_with_camera_pose(obj, cam_pos_w, cam_rot_w, fx, fy, cx, cy, robot_pos, robot_yaw)
 
+    def _correct_object_with_camera_pose(
+        self,
+        obj: dict,
+        cam_pos_w: np.ndarray,
+        cam_rot_w: np.ndarray,
+        fx: float, fy: float, cx: float, cy: float,
+        robot_pos: np.ndarray,
+        robot_yaw: float,
+    ) -> None:
+        """使用相机真实位姿校正单个物体位置"""
+        depth_m = obj.get("depth_m")
+        centroid_uv = obj.get("centroid_uv") or obj.get("centroid")
+        if depth_m is None or centroid_uv is None:
+            return
+
+        # Handle both tuple and list forms
+        try:
+            u = float(centroid_uv[0])
+            v = float(centroid_uv[1])
+        except (TypeError, IndexError, ValueError):
+            return
+
+        depth_m_f = float(depth_m)
+        if depth_m_f <= 0.01 or depth_m_f > 100.0:
+            return
+
+        # 像素坐标转相机坐标 (OpenCV: X=右, Y=下, Z=前)
+        x = (u - cx) / fx * depth_m_f
+        y = (v - cy) / fy * depth_m_f
+        z = depth_m_f
+        p_cam = np.array([x, y, z], dtype=np.float32)
+
+        # 相机坐标转世界坐标
+        try:
+            p_world = cam_pos_w + cam_rot_w @ p_cam
+        except Exception:
+            return
+
+        # 更新物体的世界坐标
+        obj["pos_world"] = [float(p_world[0]), float(p_world[1]), float(p_world[2])]
+
+        # 计算机器人坐标系下的坐标
+        try:
+            p_robot = self._world_to_robot_frame(p_world, robot_pos, robot_yaw)
+            obj["pos_robot"] = [float(p_robot[0]), float(p_robot[1]), float(p_robot[2])]
+            obj["dist_to_robot"] = float(np.linalg.norm(p_robot[:2]))
+            obj["yaw_rel"] = float(math.atan2(p_robot[1], p_robot[0]))
+        except Exception:
+            pass
+
+        # 同时校正 grasp_pos_world 如果存在
+        grasp_offset = None
+        old_pos_w = obj.get("pos_world")
+        # 用比例关系校正 grasp_pos_world：原 grasp 相对原 pos 的偏移应该保持在机器人帧
+        if "grasp_pos_world" in obj and old_pos_w is not None:
+            try:
+                old_gpw = obj["grasp_pos_world"]
+                old_grasp_robot = self._world_to_robot_frame(
+                    np.array(old_gpw, dtype=np.float32), robot_pos, robot_yaw)
+                old_pos_robot = self._world_to_robot_frame(
+                    np.array(old_pos_w, dtype=np.float32), robot_pos, robot_yaw)
+                grasp_offset_robot = old_grasp_robot - old_pos_robot
+                new_grasp_robot = p_robot + grasp_offset_robot
+                c, s = math.cos(robot_yaw), math.sin(robot_yaw)
+                new_grasp_world = robot_pos + np.array([
+                    c * new_grasp_robot[0] - s * new_grasp_robot[1],
+                    s * new_grasp_robot[0] + c * new_grasp_robot[1],
+                    new_grasp_robot[2],
+                ], dtype=np.float32)
+                obj["grasp_pos_world"] = [float(new_grasp_world[0]), float(new_grasp_world[1]), float(new_grasp_world[2])]
+            except Exception:
+                pass
+
+    def _print_perception_targets(
+        self,
+        perception_output: dict[str, Any] | None,
+        robot_pos_world: np.ndarray,
+        robot_yaw: float,
+        pose_source: str,
+    ) -> None:
+        if not self.nav_debug or not isinstance(perception_output, dict):
+            return
+
+        target_nav = self._prepare_pipeline_object(
+            perception_output.get("target_nav"),
+            str((perception_output.get("navigation") or {}).get("camera", "ee")),
+            robot_pos_world,
+            robot_yaw,
+        )
+        target_grasp = self._prepare_pipeline_object(
+            perception_output.get("target_grasp"),
+            str((perception_output.get("grasp") or {}).get("camera", "head")),
+            robot_pos_world,
+            robot_yaw,
+        )
+        all_objects = self._collect_pipeline_objects(perception_output, robot_pos_world, robot_yaw)
+        
+        if self._step_count % 10 == 0:
+            self._log(
+                "[PERC] "
+                f"phase={perception_output.get('phase')} "
+                f"ee={len(perception_output.get('ee_objects') or [])} "
+                f"head={len(perception_output.get('head_objects') or [])} "
+                f"pose_source={pose_source}"
+            )
+        
+        if target_nav is not None and self._step_count % 10 == 0:
+            pos_w = target_nav.get("pos_world")
+            self._log(
+                "[TARGET] "
+                f"id={target_nav.get('id')} class={target_nav.get('class')} "
+                f"dist={self._safe_float(target_nav.get('depth_m'), 0.0):.2f}m "
+                f"pos_w=[{pos_w[0]:.2f},{pos_w[1]:.2f}]" if pos_w is not None else ""
+            )
+
+    def _compute_pregrasp_pose(
+        self,
+        robot_pos_world: np.ndarray,
+        target_pos_world: np.ndarray,
+        stand_off: float = 0.6,
+    ) -> tuple[np.ndarray, float]:
+        robot_xy = self._safe_numpy(robot_pos_world, np.zeros(3, dtype=np.float32))[:2]
+        target_xy = self._safe_numpy(target_pos_world, np.zeros(3, dtype=np.float32))[:2]
+        direction = robot_xy - target_xy
+        norm = float(np.linalg.norm(direction))
+        if norm < 0.01:
+            direction = np.array([1.0, 0.0], dtype=np.float32)
+            norm = 1.0
+        direction_normalized = direction / norm
+        goal_xy = target_xy + direction_normalized * stand_off
+        dx = target_xy[0] - goal_xy[0]
+        dy = target_xy[1] - goal_xy[1]
+        goal_yaw = float(math.atan2(dy, dx))
+        return goal_xy, goal_yaw
+
+    def _freeze_pregrasp_for_target(
+        self,
+        target_nav: dict[str, Any],
+        robot_pos_world: np.ndarray,
+    ) -> None:
+        target_pos_world = self._safe_numpy(target_nav.get("pos_world"), np.zeros(3, dtype=np.float32))
+        self._locked_goal_xy, self._locked_goal_yaw = self._compute_pregrasp_pose(
+            robot_pos_world,
+            target_pos_world,
+            stand_off=0.6,
+        )
+        self._locked_goal_target_id = target_nav.get("id")
+        self._locked_target_world = target_pos_world.tolist()
+        self._log(
+            f"[NAV] Locked pregrasp: id={target_nav.get('id')} "
+            f"goal_xy={self._locked_goal_xy.round(2).tolist()} goal_yaw={self._locked_goal_yaw:.2f}rad"
+        )
+
+    def _dynamic_stop_distance_for_target(self, target_nav: dict[str, Any]) -> float:
+        target_dist = self._safe_float(target_nav.get("dist_to_robot"), fallback=float("inf"))
+        if target_nav.get("source_camera") == "head" or target_dist <= self.target_near_range:
+            return self.dynamic_stop_distance_near
+        return self.dynamic_stop_distance_far
+
+    def _compute_dynamic_visual_cmd(
+        self,
+        target_nav: dict[str, Any],
+        target_pos_robot: np.ndarray,
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        target_dist = float(np.linalg.norm(target_pos_robot[:2]))
+        heading_error = float(math.atan2(target_pos_robot[1], target_pos_robot[0]))
+        stop_distance = self._dynamic_stop_distance_for_target(target_nav)
+        forward_error = float(target_pos_robot[0] - stop_distance)
+        lateral_error = float(target_pos_robot[1])
+        goal_dist = float(np.linalg.norm([forward_error, lateral_error]))
+
+        phase = "near_refine" if (
+            target_nav.get("source_camera") == "head" or target_dist <= self.target_near_range
+        ) else "far_approach"
+
+        approach_scale = float(np.clip(goal_dist / self.slow_down_radius, 0.0, 1.0))
+        heading_scale = max(self.min_heading_lin_scale, math.cos(min(abs(heading_error), math.pi / 2.0)))
+        align_threshold = self.turn_then_go_yaw_threshold if forward_error > 0.25 else self.turn_then_go_heading_hold
+
+        if abs(heading_error) > align_threshold:
+            lin_x = 0.0
+            lin_y = 0.0
+            ang_z = float(np.clip(heading_error * self.heading_kp, -self.max_ang_vel, self.max_ang_vel))
+            phase = "turn_to_target"
+        else:
+            lin_x = float(np.clip(forward_error * approach_scale * heading_scale, -self.max_lin_vel, self.max_lin_vel))
+            lin_y = 0.0
+            ang_z = 0.0
+            phase = "near_refine" if (
+                target_nav.get("source_camera") == "head" or target_dist <= self.target_near_range
+            ) else "far_approach"
+
+        stopped = False
+        if goal_dist <= self.object_stop_tolerance and abs(heading_error) <= self.object_yaw_tolerance:
+            lin_x = 0.0
+            lin_y = 0.0
+            ang_z = 0.0
+            stopped = True
+            phase = "refine_hold"
+
+        base_cmd = np.array([lin_x, lin_y, ang_z], dtype=np.float32)
+        return base_cmd, {
+            "phase": phase,
+            "target": target_nav,
+            "target_dist": target_dist,
+            "goal_dist": goal_dist,
+            "heading_error": heading_error,
+            "forward_error": forward_error,
+            "lateral_error": lateral_error,
+            "stopped": stopped,
+        }
+
+    def _compute_frozen_pregrasp_cmd(
+        self,
+        target_nav: dict[str, Any],
+        robot_pos_world: np.ndarray,
+        robot_yaw: float,
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        robot_xy = robot_pos_world[:2]
+        goal_xy = np.asarray(self._locked_goal_xy, dtype=np.float32)
+        target_world = self._safe_numpy(
+            self._locked_target_world if self._locked_target_world is not None else target_nav.get("pos_world"),
+            np.zeros(3, dtype=np.float32),
+        )
+        error_xy_w = goal_xy - robot_xy
+        pos_error_norm = float(np.linalg.norm(error_xy_w))
+
+        goal_x_robot = math.cos(robot_yaw) * error_xy_w[0] + math.sin(robot_yaw) * error_xy_w[1]
+        goal_y_robot = -math.sin(robot_yaw) * error_xy_w[0] + math.cos(robot_yaw) * error_xy_w[1]
+        desired_yaw = float(math.atan2(target_world[1] - robot_pos_world[1], target_world[0] - robot_pos_world[0]))
+        yaw_error = self._wrap_angle(desired_yaw - robot_yaw)
+
+        approach_scale = float(np.clip(pos_error_norm / self.slow_down_radius, 0.0, 1.0))
+        heading_scale = max(self.min_heading_lin_scale, math.cos(min(abs(yaw_error), math.pi / 2.0)))
+        align_threshold = self.turn_then_go_yaw_threshold if pos_error_norm > 0.25 else self.turn_then_go_heading_hold
+        if abs(yaw_error) > align_threshold:
+            lin_x = 0.0
+            lin_y = 0.0
+            ang_z = float(np.clip(yaw_error * self.heading_kp, -self.max_ang_vel, self.max_ang_vel))
+            phase = "turn_to_pregrasp"
+        else:
+            lin_x = float(np.clip(goal_x_robot * approach_scale * heading_scale, -self.max_lin_vel, self.max_lin_vel))
+            lin_y = 0.0
+            ang_z = 0.0
+            phase = "locked_pregrasp"
+        stopped = False
+        if pos_error_norm <= 0.32 and abs(yaw_error) <= self.object_yaw_tolerance:
+            lin_x = 0.0
+            lin_y = 0.0
+            ang_z = 0.0
+            phase = "ready_to_grasp"
+            stopped = True
+
+        base_cmd = np.array([lin_x, lin_y, ang_z], dtype=np.float32)
+        target_dist = float(np.linalg.norm(target_world[:2] - robot_pos_world[:2]))
+        return base_cmd, {
+            "phase": phase,
+            "target": target_nav,
+            "target_dist": target_dist,
+            "goal_dist": pos_error_norm,
+            "heading_error": yaw_error,
+            "forward_error": float(goal_x_robot),
+            "lateral_error": float(goal_y_robot),
+            "stopped": stopped,
+        }
+
+    def _compute_nav_cmd_from_target_nav(self, target_nav: dict[str, Any]) -> tuple[np.ndarray, dict[str, Any]]:
+        robot_pos_world, robot_yaw, _ = self._resolve_robot_pose_world({}, {}, None)
+        target_pos_world = self._safe_numpy(target_nav.get("pos_world"), np.zeros(3, dtype=np.float32))
+        target_pos_robot = self._safe_numpy(target_nav.get("pos_robot"), np.zeros(3, dtype=np.float32))
+        if not np.all(np.isfinite(target_pos_robot)) or float(np.linalg.norm(target_pos_robot[:2])) < 1e-6:
+            target_pos_robot = self._world_to_robot_frame(target_pos_world, robot_pos_world, robot_yaw)
+        target_nav["pos_robot"] = target_pos_robot.tolist()
+        target_nav["dist_to_robot"] = float(np.linalg.norm(target_pos_robot[:2]))
+        target_nav["yaw_rel"] = float(math.atan2(target_pos_robot[1], target_pos_robot[0]))
+
+        # Close-range head relocalization can invalidate a stale frozen pregrasp.
+        if (
+            self._locked_target_world is not None
+            and bool(target_nav.get("visible", True))
+            and target_nav.get("source_camera") == "head"
+            and target_nav["dist_to_robot"] <= self.target_near_range
+        ):
+            frozen_target = self._safe_numpy(self._locked_target_world, np.zeros(3, dtype=np.float32))
+            disagreement = float(np.linalg.norm(target_pos_world[:2] - frozen_target[:2]))
+            if disagreement > self.target_relock_disagreement:
+                self._log(
+                    f"[NAV] head relocalization disagrees with frozen target by {disagreement:.2f}m, "
+                    "unlocking pregrasp"
+                )
+                self._clear_frozen_pregrasp()
+
+        if (
+            self._locked_goal_xy is None
+            and bool(target_nav.get("confirmed", False))
+            and bool(target_nav.get("visible", True))
+            and target_nav["dist_to_robot"] <= self.target_freeze_distance
+            and target_nav.get("source_camera") == "head"
+            and int(target_nav.get("head_stable_count", 0)) >= self.target_head_confirm_steps
+        ):
+            self._freeze_pregrasp_for_target(target_nav, robot_pos_world)
+
+        if self._locked_goal_xy is not None and self._locked_goal_yaw is not None:
+            return self._compute_frozen_pregrasp_cmd(target_nav, robot_pos_world, robot_yaw)
+        return self._compute_dynamic_visual_cmd(target_nav, target_pos_robot)
+
+    @staticmethod
+    def _wrap_angle(angle: float) -> float:
+        return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
+    def _make_pipeline_nav_info(
+        self,
+        perception_output: dict[str, Any] | None,
+        pose_source: str,
+        target: dict[str, Any] | None = None,
+        phase: str | None = None,
+        stopped: bool = False,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        robot_pos_world = None
+        robot_yaw = None
+        if isinstance(perception_output, dict):
+            robot = perception_output.get("robot") or {}
+            robot_pos_world = robot.get("pos_world")
+            robot_yaw = robot.get("yaw")
+        objects = self._collect_pipeline_objects(
+            perception_output,
+            self._safe_numpy(robot_pos_world, self._odom_pos),
+            self._safe_float(robot_yaw, self._odom_yaw),
+        )
+        info = {
+            "phase": phase or (None if perception_output is None else str(perception_output.get("phase", "approach"))),
+            "target": target,
+            "stopped": stopped,
+            "target_source_camera": None if target is None else target.get("source_camera"),
+            "preferred_camera": None if perception_output is None else perception_output.get("active_camera"),
+            "pose_source": pose_source,
+            "objects_detailed": objects,
+            "objects_remaining": objects,
+        }
+        if extra:
+            info.update(extra)
+        return info
+
+    def _normalize_object(
+        self,
+        obj: dict[str, Any],
+        source_camera: str,
+        robot_pos_world: np.ndarray,
+        robot_yaw: float,
+    ) -> dict[str, Any] | None:
+        if not isinstance(obj, dict):
+            return None
+
+        pos_world = obj.get("pos_world")
+        pos_robot = obj.get("pos_robot")
+
+        if pos_world is not None:
+            pos_world_np = self._safe_numpy(pos_world, np.zeros(3, dtype=np.float32))
+        elif pos_robot is not None:
+            pos_world_np = self._robot_to_world_frame(pos_robot, robot_pos_world, robot_yaw)
+        else:
+            return None
+
+        if not np.all(np.isfinite(pos_world_np)):
+            return None
+
+        pos_robot_np = self._world_to_robot_frame(pos_world_np, robot_pos_world, robot_yaw)
+        if not np.all(np.isfinite(pos_robot_np)):
+            return None
+
+        out = dict(obj)
+        out["source_camera"] = source_camera
+        out["camera"] = source_camera
+        out["pos_world"] = pos_world_np.tolist()
+        out["pos_robot"] = pos_robot_np.tolist()
+        out["dist_to_robot"] = float(np.linalg.norm(pos_robot_np[:2]))
+        out["yaw_rel"] = float(math.atan2(pos_robot_np[1], pos_robot_np[0]))
+        out["conf"] = self._safe_float(obj.get("conf", 1.0), 1.0)
+
+        if out.get("grasp_pos_world") is None:
+            grasp_pos = pos_world_np.copy()
+            out["grasp_pos_world"] = grasp_pos.tolist()
+
+        return out
+
+    def _is_valid_target_candidate(self, obj: dict[str, Any]) -> bool:
+        if not isinstance(obj, dict):
+            return False
+        if obj.get("in_bin", False):
+            return False
+        if self._safe_float(obj.get("conf", 1.0), 1.0) < self.min_target_conf:
+            return False
+
+        pos_robot = self._safe_numpy(obj.get("pos_robot"), np.zeros(3, dtype=np.float32))
+        if not np.all(np.isfinite(pos_robot)):
+            return False
+        if pos_robot[0] <= 0.05:
+            return False
+
+        dist = self._safe_float(obj.get("dist_to_robot", np.linalg.norm(pos_robot[:2])), fallback=float("inf"))
+        if not np.isfinite(dist) or dist < self.min_target_distance or dist > self.max_target_distance:
+            return False
+
+        depth_m = obj.get("depth_m")
+        if depth_m is not None:
+            depth_value = self._safe_float(depth_m, fallback=float("inf"))
+            if not np.isfinite(depth_value) or depth_value <= 0.05:
+                return False
+
+        return True
+
+    def _normalize_camera_objects(
+        self,
+        objects: list[dict[str, Any]] | None,
+        source_camera: str,
+        robot_pos_world: np.ndarray,
+        robot_yaw: float,
+    ) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        for obj in objects or []:
+            adapted = self._normalize_object(obj, source_camera, robot_pos_world, robot_yaw)
+            if adapted is not None and self._is_valid_target_candidate(adapted):
+                normalized.append(adapted)
+        normalized.sort(key=lambda item: self._safe_float(item.get("dist_to_robot"), fallback=float("inf")))
+        return normalized
+
+    def _tracking_alpha(self, source_camera: str) -> float:
+        return self.target_ema_alpha_head if source_camera == "head" else self.target_ema_alpha_ee
+
+    def _tracking_match_radius(self, source_camera: str, target_dist: float) -> float:
+        if source_camera == "head" or target_dist <= self.target_near_range:
+            return self.target_near_match_radius
+        return self.target_far_match_radius
+
+    def _set_locked_target_snapshot(self, target: dict[str, Any] | None) -> None:
+        if not isinstance(target, dict):
+            self._locked_target = None
+            return
+        self._locked_target = {
+            "class": target.get("class"),
+            "id": target.get("id"),
+            "source_camera": target.get("source_camera"),
+            "pos_world": self._safe_numpy(target.get("pos_world"), np.zeros(3, dtype=np.float32)).tolist(),
+            "pos_robot": self._safe_numpy(target.get("pos_robot"), np.zeros(3, dtype=np.float32)).tolist(),
+            "last_seen_step": self._step_count,
+        }
+
+    def _clear_frozen_pregrasp(self) -> None:
+        self._locked_goal_xy = None
+        self._locked_goal_yaw = None
+        self._locked_goal_target_id = None
+        self._locked_target_world = None
+
+    def _clear_locked_target(self) -> None:
+        self._locked_target = None
+        self._pending_target = None
+        self._tracked_target = None
+        self._last_known_target_pos = None
+        self._target_lost_count = 0
+        self._clear_frozen_pregrasp()
+
+    def _make_tracking_state(self, candidate: dict[str, Any], stable_count: int = 1) -> dict[str, Any]:
+        pos_world = self._safe_numpy(candidate.get("pos_world"), np.zeros(3, dtype=np.float32))
+        pos_robot = self._safe_numpy(candidate.get("pos_robot"), np.zeros(3, dtype=np.float32))
+        source_camera = str(candidate.get("source_camera", "ee"))
+        return {
+            "id": candidate.get("id"),
+            "class": candidate.get("class"),
+            "source_camera": source_camera,
+            "filtered_pos_world": pos_world.tolist(),
+            "last_candidate": dict(candidate),
+            "last_seen_step": self._step_count,
+            "stable_count": stable_count,
+            "head_stable_count": 1 if source_camera == "head" else 0,
+            "dist_to_robot": float(np.linalg.norm(pos_robot[:2])),
+            "conf": self._safe_float(candidate.get("conf", 1.0), 1.0),
+        }
+
+    def _target_state_distance(self, state_or_target: dict[str, Any], candidate: dict[str, Any]) -> float:
+        state_pos = state_or_target.get("filtered_pos_world")
+        if state_pos is None:
+            state_pos = state_or_target.get("pos_world")
+        candidate_pos = candidate.get("pos_world")
+        if state_pos is None or candidate_pos is None:
+            return float("inf")
+        state_pos_np = self._safe_numpy(state_pos, np.zeros(3, dtype=np.float32))
+        candidate_pos_np = self._safe_numpy(candidate_pos, np.zeros(3, dtype=np.float32))
+        return float(np.linalg.norm(state_pos_np[:2] - candidate_pos_np[:2]))
+
+    def _targets_compatible(
+        self,
+        state_or_target: dict[str, Any],
+        candidate: dict[str, Any],
+        radius: float,
+    ) -> bool:
+        track_class = state_or_target.get("class")
+        cand_class = candidate.get("class")
+        if track_class is not None and cand_class is not None and track_class != cand_class:
+            return False
+        return self._target_state_distance(state_or_target, candidate) <= radius
+
+    def _candidate_rank(
+        self,
+        candidate: dict[str, Any],
+        preferred_camera: str,
+        reference: dict[str, Any] | None = None,
+    ) -> float:
+        pos_robot = self._safe_numpy(candidate.get("pos_robot"), np.zeros(3, dtype=np.float32))
+        pos_world = self._safe_numpy(candidate.get("pos_world"), np.zeros(3, dtype=np.float32))
+        dist = self._safe_float(candidate.get("dist_to_robot"), float(np.linalg.norm(pos_robot[:2])))
+        conf = self._safe_float(candidate.get("conf", 1.0), 1.0)
+        yaw_rel = abs(self._safe_float(candidate.get("yaw_rel", math.atan2(pos_robot[1], pos_robot[0]))))
+        score = dist
+        score += yaw_rel * 0.35
+        score += max(abs(float(pos_world[2])) - 0.35, 0.0) * 0.3
+        score += (1.0 - conf) * 0.45
+        if candidate.get("source_camera") != preferred_camera:
+            score += 0.12
+        if reference is not None:
+            score += self._target_state_distance(reference, candidate) * 2.2
+            ref_class = reference.get("class")
+            if ref_class is not None and candidate.get("class") is not None and candidate.get("class") != ref_class:
+                score += 3.0
+        return score
+
+    def _select_best_candidate(
+        self,
+        candidates: list[dict[str, Any]],
+        preferred_camera: str,
+        reference: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         if not candidates:
             return None
-        candidates.sort(key=lambda item: item[0])
-        return candidates[0][1]
+        return min(candidates, key=lambda candidate: self._candidate_rank(candidate, preferred_camera, reference))
+
+    def _match_candidate_to_track(
+        self,
+        candidates: list[dict[str, Any]],
+        track: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        best_match = None
+        best_score = float("inf")
+        track_dist = self._safe_float(track.get("dist_to_robot"), float("inf"))
+        for candidate in candidates:
+            cand_dist = self._safe_float(candidate.get("dist_to_robot"), fallback=float("inf"))
+            radius = self._tracking_match_radius(str(candidate.get("source_camera", "ee")), min(track_dist, cand_dist))
+            if not self._targets_compatible(track, candidate, radius):
+                continue
+            score = self._candidate_rank(candidate, str(track.get("source_camera", "ee")), track)
+            if score < best_score:
+                best_score = score
+                best_match = candidate
+        return best_match
+
+    def _update_tracking_state_from_candidate(
+        self,
+        state: dict[str, Any],
+        candidate: dict[str, Any],
+    ) -> dict[str, Any]:
+        alpha = self._tracking_alpha(str(candidate.get("source_camera", "ee")))
+        prev_pos = self._safe_numpy(state.get("filtered_pos_world"), np.zeros(3, dtype=np.float32))
+        obs_pos = self._safe_numpy(candidate.get("pos_world"), np.zeros(3, dtype=np.float32))
+        filtered_pos = (1.0 - alpha) * prev_pos + alpha * obs_pos
+        pos_robot = self._safe_numpy(candidate.get("pos_robot"), np.zeros(3, dtype=np.float32))
+        state["filtered_pos_world"] = filtered_pos.tolist()
+        state["last_candidate"] = dict(candidate)
+        state["source_camera"] = candidate.get("source_camera")
+        state["id"] = candidate.get("id", state.get("id"))
+        if candidate.get("class") is not None:
+            state["class"] = candidate.get("class")
+        state["last_seen_step"] = self._step_count
+        state["stable_count"] = min(int(state.get("stable_count", 0)) + 1, self.target_confirm_steps + 4)
+        if candidate.get("source_camera") == "head" and float(np.linalg.norm(pos_robot[:2])) <= self.target_near_range:
+            state["head_stable_count"] = min(
+                int(state.get("head_stable_count", 0)) + 1,
+                self.target_head_confirm_steps + 4,
+            )
+        else:
+            state["head_stable_count"] = max(int(state.get("head_stable_count", 0)) - 1, 0)
+        state["dist_to_robot"] = float(np.linalg.norm(pos_robot[:2]))
+        state["conf"] = self._safe_float(candidate.get("conf", state.get("conf", 1.0)), 1.0)
+        return state
+
+    def _build_tracked_nav_target(
+        self,
+        track: dict[str, Any],
+        robot_pos_world: np.ndarray,
+        robot_yaw: float,
+    ) -> dict[str, Any]:
+        filtered_pos = self._safe_numpy(track.get("filtered_pos_world"), np.zeros(3, dtype=np.float32))
+        pos_robot = self._world_to_robot_frame(filtered_pos, robot_pos_world, robot_yaw)
+        target = dict(track.get("last_candidate") or {})
+        target["id"] = track.get("id")
+        target["class"] = track.get("class")
+        target["source_camera"] = track.get("source_camera")
+        target["camera"] = track.get("source_camera")
+        target["pos_world"] = filtered_pos.tolist()
+        target["pos_robot"] = pos_robot.tolist()
+        target["dist_to_robot"] = float(np.linalg.norm(pos_robot[:2]))
+        target["yaw_rel"] = float(math.atan2(pos_robot[1], pos_robot[0]))
+        target["stable_count"] = int(track.get("stable_count", 0))
+        target["head_stable_count"] = int(track.get("head_stable_count", 0))
+        target["confirmed"] = True
+        target["visible"] = int(track.get("last_seen_step", -1)) == self._step_count
+        target["last_seen_step"] = int(track.get("last_seen_step", self._step_count))
+        if target.get("grasp_pos_world") is None:
+            target["grasp_pos_world"] = filtered_pos.tolist()
+        return target
+
+    def _update_visual_target_tracking(
+        self,
+        preferred_candidates: list[dict[str, Any]],
+        fallback_candidates: list[dict[str, Any]],
+        preferred_camera: str,
+        robot_pos_world: np.ndarray,
+        robot_yaw: float,
+    ) -> dict[str, Any] | None:
+        all_candidates = preferred_candidates + fallback_candidates
+
+        if self._tracked_target is not None:
+            matched = self._match_candidate_to_track(all_candidates, self._tracked_target)
+            if matched is not None:
+                self._tracked_target = self._update_tracking_state_from_candidate(self._tracked_target, matched)
+                self._target_lost_count = 0
+            else:
+                same_class_candidates = [
+                    candidate
+                    for candidate in all_candidates
+                    if self._tracked_target.get("class") in {None, candidate.get("class")}
+                ]
+                if same_class_candidates:
+                    self._target_lost_count += 1
+                else:
+                    self._target_lost_count += 2
+                if self._target_lost_count > self.target_lock_timeout_steps:
+                    self._log("[NAV] tracked target lost too long, clearing visual target state")
+                    self._clear_locked_target()
+                    return None
+
+        if self._tracked_target is None:
+            best = self._select_best_candidate(all_candidates, preferred_camera, self._pending_target)
+            if best is None:
+                if (
+                    self._pending_target is not None
+                    and self._step_count - int(self._pending_target.get("last_seen_step", self._step_count))
+                    > self.target_pending_timeout_steps
+                ):
+                    self._pending_target = None
+                return None
+
+            if self._pending_target is not None and self._targets_compatible(
+                self._pending_target,
+                best,
+                self.target_pending_match_radius,
+            ):
+                self._pending_target = self._update_tracking_state_from_candidate(self._pending_target, best)
+            else:
+                self._pending_target = self._make_tracking_state(best, stable_count=1)
+
+            if int(self._pending_target.get("stable_count", 0)) >= self.target_confirm_steps:
+                self._tracked_target = dict(self._pending_target)
+                self._pending_target = None
+                self._target_lost_count = 0
+                self._log(
+                    "[NAV] Confirmed tracked target: "
+                    f"id={self._tracked_target.get('id')} class={self._tracked_target.get('class')} "
+                    f"camera={self._tracked_target.get('source_camera')}"
+                )
+
+        if self._tracked_target is None:
+            return None
+
+        target = self._build_tracked_nav_target(self._tracked_target, robot_pos_world, robot_yaw)
+        self._last_known_target_pos = target.get("pos_world")
+        self._set_locked_target_snapshot(target)
+        return target
+
+    def _get_camera_hint(self, perception_output: dict[str, Any], camera: str) -> dict[str, Any] | None:
+        for key in ("navigation", "grasp"):
+            section = perception_output.get(key) or {}
+            if section.get("camera") == camera and isinstance(section.get("target"), dict):
+                return section.get("target")
+        return None
+
+    def _build_search_nav_info(self, nav_input: dict[str, Any], target: dict[str, Any] | None) -> dict[str, Any]:
+        robot = nav_input.get("robot") or {}
+        return {
+            "phase": str(nav_input.get("phase", "search")),
+            "goal_dist": 0.0,
+            "bin_dist": 0.0,
+            "heading_error": 0.0,
+            "target_dist": 0.0,
+            "stopped": False,
+            "target": target,
+            "pose_source": robot.get("pose_source"),
+            "preferred_camera": nav_input.get("preferred_camera"),
+            "fallback_camera": nav_input.get("fallback_camera"),
+            "target_source_camera": nav_input.get("target_source_camera"),
+            "objects_detailed": list(nav_input.get("objects_detailed") or []),
+            "objects_remaining": list(nav_input.get("objects_remaining") or []),
+            "searching": True,
+        }
+
+    def _attach_nav_debug_context(
+        self,
+        nav_info: dict[str, Any],
+        nav_input: dict[str, Any],
+        target: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        merged = dict(nav_info)
+        robot = nav_input.get("robot") or {}
+        merged["target"] = target
+        merged["preferred_camera"] = nav_input.get("preferred_camera")
+        merged["fallback_camera"] = nav_input.get("fallback_camera")
+        merged["target_source_camera"] = nav_input.get("target_source_camera")
+        merged["pose_source"] = robot.get("pose_source")
+        merged["objects_detailed"] = list(nav_input.get("objects_detailed") or [])
+        merged["objects_remaining"] = list(nav_input.get("objects_remaining") or [])
+        return merged
+
+    def _adapt_perception_output(
+        self,
+        obs: dict[str, Any],
+        local_nav: dict[str, Any],
+        perception_output: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        robot_pos_world, robot_yaw, pose_source = self._resolve_robot_pose_world(obs, local_nav, perception_output)
+
+        phase = str(perception_output.get("phase", "approach"))
+        preferred_camera = "head" if phase == "grasp" else "ee"
+        fallback_camera = "ee" if preferred_camera == "head" else "head"
+
+        preferred_raw = perception_output.get("head_objects", []) if preferred_camera == "head" else perception_output.get("ee_objects", [])
+        fallback_raw = perception_output.get("ee_objects", []) if preferred_camera == "head" else perception_output.get("head_objects", [])
+
+        preferred_candidates = self._normalize_camera_objects(preferred_raw, preferred_camera, robot_pos_world, robot_yaw)
+        fallback_candidates = self._normalize_camera_objects(fallback_raw, fallback_camera, robot_pos_world, robot_yaw)
+
+        target = self._update_visual_target_tracking(
+            preferred_candidates,
+            fallback_candidates,
+            preferred_camera,
+            robot_pos_world,
+            robot_yaw,
+        )
+
+        bin_info = perception_output.get("bin") or {}
+        bin_center = self._safe_numpy(bin_info.get("center_world"), self.default_bin_center)
+
+        nav_input = {
+            "robot": {
+                "pos_world": robot_pos_world.tolist(),
+                "yaw": float(robot_yaw),
+                "pose_source": pose_source,
+            },
+            "bin": {
+                "center_world": bin_center.tolist(),
+            },
+            "phase": phase,
+            "preferred_camera": preferred_camera,
+            "fallback_camera": fallback_camera,
+            "target_source_camera": None if target is None else target.get("source_camera"),
+            "target": target,
+            "objects_detailed": preferred_candidates + fallback_candidates,
+            "objects_remaining": preferred_candidates + fallback_candidates,
+        }
+        return nav_input, target
 
     def _compute_object_cmd(self, target: dict[str, Any]) -> tuple[np.ndarray, dict[str, Any]]:
         pos_robot = self._safe_numpy(target.get("pos_robot"), np.zeros(3, dtype=np.float32))
-        if pos_robot[0] <= 0.05:
+        # 检查是否有有效距离
+        target_dist = float(np.linalg.norm(pos_robot[:2]))
+        if target_dist < 0.05:
             return np.zeros(3, dtype=np.float32), {
                 "phase": "search",
                 "goal_dist": 0.0,
                 "target_dist": 0.0,
                 "heading_error": 0.0,
+                "forward_error": 0.0,
+                "lateral_error": 0.0,
+                "stopped": False,
                 "target": target,
             }
 
-        target_dist = float(np.linalg.norm(pos_robot[:2]))
         heading_error = float(math.atan2(pos_robot[1], pos_robot[0]))
         forward_error = float(pos_robot[0] - self.object_stop_distance)
         lateral_error = float(pos_robot[1])
         goal_dist = float(np.linalg.norm([forward_error, lateral_error]))
 
-        if target_dist <= self.object_stop_distance + self.object_stop_tolerance:
+        close_forward = abs(forward_error) <= self.object_forward_tolerance
+        close_lateral = abs(lateral_error) <= self.object_lateral_tolerance
+        close_heading = abs(heading_error) <= self.object_yaw_tolerance
+
+        if close_forward and close_lateral and close_heading:
+            lin_x = 0.0
+            lin_y = 0.0
+            ang_z = 0.0
+            phase = "stopped"
+        elif close_forward and close_lateral:
             lin_x = 0.0
             lin_y = 0.0
             ang_z = float(np.clip(heading_error * self.heading_kp, -self.max_ang_vel, self.max_ang_vel))
             phase = "align"
-            if abs(heading_error) <= self.object_yaw_tolerance:
-                ang_z = 0.0
-                phase = "stopped"
         else:
             approach_scale = float(np.clip(goal_dist / self.slow_down_radius, 0.0, 1.0))
             heading_scale = max(self.min_heading_lin_scale, math.cos(min(abs(heading_error), math.pi / 2.0)))
@@ -279,24 +1551,26 @@ class AlgSolution:
             "goal_dist": goal_dist,
             "target_dist": target_dist,
             "heading_error": heading_error,
+            "forward_error": forward_error,
+            "lateral_error": lateral_error,
+            "stopped": phase == "stopped",
             "target": target,
         }
 
     def _get_navigation_input(self, obs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
         local_nav = self._update_local_odometry(obs)
-        if self.perception is None:
-            return local_nav, None
 
+        gt_pose = self._get_ground_truth_robot_pose()
+        gt_pos = gt_pose[0] if gt_pose is not None else None
+        gt_yaw = gt_pose[1] if gt_pose is not None else None
         try:
-            perception_output = self.perception.process(obs, dt=self.dt)
+            perception_output = self.perception.process(obs, dt=self.dt, gt_robot_pos=gt_pos, gt_robot_yaw=gt_yaw)
+            return self._adapt_perception_output(obs, local_nav, perception_output)
         except Exception as exc:
             if not self._perception_error_printed:
-                print(f"[TaskB-PERCEPTION] disabled after error: {type(exc).__name__}: {exc}", flush=True)
+                self._log(f"[TaskB-PERCEPTION] disabled after error: {type(exc).__name__}: {exc}")
                 self._perception_error_printed = True
             return local_nav, None
-
-        target = self._select_target(perception_output)
-        return perception_output, target
 
     def _compute_base_cmd(self, nav_input: dict[str, Any]) -> tuple[np.ndarray, dict[str, float]]:
         robot_info = nav_input.get("robot") or {}
@@ -311,7 +1585,12 @@ class AlgSolution:
         vector_to_bin = bin_center[:2] - robot_pos[:2]
         dist_to_bin = float(np.linalg.norm(vector_to_bin))
         if not np.isfinite(dist_to_bin) or dist_to_bin < 1e-6:
-            return np.zeros(3, dtype=np.float32), {"heading": 0.0, "goal_dist": 0.0, "bin_dist": dist_to_bin}
+            return np.zeros(3, dtype=np.float32), {
+                "heading": 0.0,
+                "goal_dist": 0.0,
+                "bin_dist": dist_to_bin,
+                "stopped": True,
+            }
 
         stop_point = bin_center[:2] - self.stop_distance * vector_to_bin / dist_to_bin
         vector_to_goal = stop_point - robot_pos[:2]
@@ -322,6 +1601,7 @@ class AlgSolution:
                 "heading": 0.0,
                 "goal_dist": max(goal_dist, 0.0),
                 "bin_dist": dist_to_bin,
+                "stopped": True,
             }
 
         cos_yaw = math.cos(robot_yaw)
@@ -345,7 +1625,13 @@ class AlgSolution:
 
         base_cmd = np.array([lin_x, lin_y, ang_z], dtype=np.float32)
         base_cmd = np.nan_to_num(base_cmd, nan=0.0, posinf=0.0, neginf=0.0)
-        return base_cmd, {"heading": desired_heading, "heading_error": heading_error, "goal_dist": goal_dist, "bin_dist": dist_to_bin}
+        return base_cmd, {
+            "heading": desired_heading,
+            "heading_error": heading_error,
+            "goal_dist": goal_dist,
+            "bin_dist": dist_to_bin,
+            "stopped": np.allclose(base_cmd, 0.0),
+        }
 
     def _extract_policy_obs(self, obs: dict[str, Any], base_cmd: np.ndarray) -> torch.Tensor:
         proprio = torch.as_tensor(obs["proprio"], device=self.device, dtype=torch.float32)
@@ -403,69 +1689,576 @@ class AlgSolution:
         num_envs = action_train.shape[0]
         action_env = torch.zeros((num_envs, self.total_action_dim), device=self.device, dtype=torch.float32)
         action_env[:, :self.leg_action_dim] = action_train * self.leg_action_scale
-        action_env[:, self.leg_action_dim:] = self.arm_default_action.repeat(num_envs, 1)
+        # 机械臂动作空间使用相对默认位置的偏差（use_default_offset=True）
+        # 当动作值为 0 时，机械臂会保持在环境配置中设置的默认位置
+        action_env[:, self.leg_action_dim:] = 0.0
         return torch.nan_to_num(action_env, nan=0.0, posinf=0.0, neginf=0.0)
 
-    def _maybe_print_nav_debug(self, base_cmd: np.ndarray, nav_info: dict[str, float]) -> None:
-        if not self.nav_debug:
+    def _format_rgb_overlay(self, rgb: np.ndarray, nav_info: dict[str, Any], camera_name: str, detected_objects: list = None) -> np.ndarray:
+        bgr = np.ascontiguousarray(rgb[..., :3][:, :, ::-1])
+        phase = str(nav_info.get("phase", "nav"))
+        source_camera = nav_info.get("target_source_camera") or nav_info.get("preferred_camera") or "none"
+        stopped = bool(nav_info.get("stopped", False))
+        target = nav_info.get("target")
+        target_label = "none" if target is None else f"{target.get('class', '?')}#{target.get('id', '?')}"
+        target_robot = None if target is None else target.get("pos_robot")
+        target_world = None if target is None else target.get("pos_world")
+        target_dist = float(nav_info.get("target_dist", 0.0))
+        lines = [
+            f"{camera_name} phase={phase}",
+            f"target_cam={source_camera} stopped={int(stopped)}",
+            f"target={target_label}",
+        ]
+        if target_robot is not None:
+            target_robot_np = np.asarray(target_robot, dtype=np.float32).round(2).tolist()
+            lines.append(f"target_robot={target_robot_np} d={target_dist:.2f}m")
+        elif nav_info.get("searching"):
+            lines.append("target_robot=None scanning")
+        if target_world is not None:
+            target_world_np = np.asarray(target_world, dtype=np.float32).round(2).tolist()
+            lines.append(f"target_world={target_world_np}")
+        y = 22
+        for line in lines:
+            cv2.putText(bgr, line, (8, y), 0, 0.5, (0, 255, 255), 2)
+            y += 20
+
+        if detected_objects is not None and cv2 is not None:
+            for obj in detected_objects:
+                bbox = obj.get("bbox")
+                if bbox is not None and len(bbox) == 4:
+                    x1, y1, x2, y2 = bbox
+                    x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                    obj_class = obj.get("class", "unknown")
+                    conf = obj.get("conf", 0.0)
+                    is_target = target is not None and obj.get("id") == target.get("id")
+                    color = (0, 0, 255) if is_target else (0, 255, 0)
+                    cv2.rectangle(bgr, (x1, y1), (x2, y2), color, 2)
+                    pos_robot = obj.get("pos_robot")
+                    if pos_robot is not None:
+                        pos_robot_np = np.asarray(pos_robot, dtype=np.float32).round(2).tolist()
+                        coord_label = f"r={pos_robot_np}"
+                    else:
+                        coord_label = "r=?"
+                    label = f"{obj_class}: {conf:.2f}"
+                    cv2.putText(bgr, label, (x1, y1 - 5), 0, 0.4, color, 1)
+                    cv2.putText(bgr, coord_label, (x1, min(bgr.shape[0] - 8, y2 + 16)), 0, 0.4, color, 1)
+
+        return bgr
+
+    def _maybe_show_rgb_debug(self, obs: dict[str, Any], nav_info: dict[str, Any]) -> None:
+        if not self.show_rgb and not self.save_rgb:
+            return
+        if self._step_count % self.rgb_debug_every != 0:
             return
 
-        self._nav_debug_step += 1
-        if self._nav_debug_step % self.nav_debug_every != 0:
+        image_obs = obs.get("image") or {}
+        detected_objects = nav_info.get("objects_detailed", [])
+
+        try:
+            head_rgb = self._tensor_to_numpy(image_obs.get("head_rgb"))
+            ee_rgb = self._tensor_to_numpy(image_obs.get("ee_rgb"))
+            head_depth = self._tensor_to_numpy(image_obs.get("head_depth"))
+            ee_depth = self._tensor_to_numpy(image_obs.get("ee_depth"))
+
+            head_objects = [obj for obj in detected_objects if obj.get("source_camera") == "head"]
+            ee_objects = [obj for obj in detected_objects if obj.get("source_camera") == "ee"]
+
+            if head_rgb is not None:
+                head_rgb = np.asarray(head_rgb).squeeze()
+                if head_rgb.ndim == 3 and head_rgb.shape[-1] >= 3:
+                    head_bgr = self._format_rgb_overlay(head_rgb.astype(np.uint8), nav_info, "head", head_objects)
+                    if self.show_rgb and not self._rgb_debug_failed:
+                        if os.name != "nt" and not os.environ.get("DISPLAY"):
+                            if not self._rgb_debug_warned:
+                                self._log("[TaskB-RGB] DISPLAY not available, RGB debug disabled.")
+                                self._rgb_debug_warned = True
+                            self._rgb_debug_failed = True
+                        else:
+                            cv2.imshow("head_rgb", head_bgr)
+                    if self.save_rgb:
+                        head_path = os.path.join(self.save_rgb_dir, f"head_{self._step_count:06d}.png")
+                        cv2.imwrite(head_path, head_bgr)
+
+            if head_depth is not None and depth_to_vis is not None:
+                head_depth = np.asarray(head_depth).squeeze()
+                if head_depth.ndim == 2 or (head_depth.ndim == 3 and head_depth.shape[-1] == 1):
+                    if head_depth.ndim == 3:
+                        head_depth = head_depth[:, :, 0]
+                    head_depth_vis = depth_to_vis(head_depth.astype(np.float32))
+                    if self.show_rgb and not self._rgb_debug_failed:
+                        cv2.imshow("head_depth", head_depth_vis)
+                    if self.save_rgb:
+                        depth_path = os.path.join(self.save_rgb_dir, f"head_depth_{self._step_count:06d}.png")
+                        cv2.imwrite(depth_path, head_depth_vis)
+
+            if ee_rgb is not None:
+                ee_rgb = np.asarray(ee_rgb).squeeze()
+                if ee_rgb.ndim == 3 and ee_rgb.shape[-1] >= 3:
+                    ee_bgr = self._format_rgb_overlay(ee_rgb.astype(np.uint8), nav_info, "ee", ee_objects)
+                    if self.show_rgb and not self._rgb_debug_failed:
+                        cv2.imshow("ee_rgb", ee_bgr)
+                    if self.save_rgb:
+                        ee_path = os.path.join(self.save_rgb_dir, f"ee_{self._step_count:06d}.png")
+                        cv2.imwrite(ee_path, ee_bgr)
+
+            if ee_depth is not None and depth_to_vis is not None:
+                ee_depth = np.asarray(ee_depth).squeeze()
+                if ee_depth.ndim == 2 or (ee_depth.ndim == 3 and ee_depth.shape[-1] == 1):
+                    if ee_depth.ndim == 3:
+                        ee_depth = ee_depth[:, :, 0]
+                    ee_depth_vis = depth_to_vis(ee_depth.astype(np.float32))
+                    if self.show_rgb and not self._rgb_debug_failed:
+                        cv2.imshow("ee_depth", ee_depth_vis)
+                    if self.save_rgb:
+                        depth_path = os.path.join(self.save_rgb_dir, f"ee_depth_{self._step_count:06d}.png")
+                        cv2.imwrite(depth_path, ee_depth_vis)
+
+            if self.show_rgb and not self._rgb_debug_failed:
+                cv2.waitKey(1)
+        except Exception as exc:
+            if not self._rgb_debug_warned:
+                self._log(f"[TaskB-RGB] debug disabled after error: {type(exc).__name__}: {exc}")
+                self._rgb_debug_warned = True
+            self._rgb_debug_failed = True
+
+    @staticmethod
+    def _vis_gray_image(image: np.ndarray | None, turbo: bool = False) -> np.ndarray | None:
+        if image is None:
+            return None
+        arr = np.asarray(image)
+        if arr.ndim == 3 and arr.shape[-1] == 3:
+            return np.ascontiguousarray(arr)
+        if arr.ndim != 2:
+            return None
+        vis = np.asarray(arr, dtype=np.uint8)
+        if turbo and cv2 is not None:
+            return cv2.applyColorMap(vis, cv2.COLORMAP_TURBO)
+        if cv2 is not None:
+            return cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
+        return np.repeat(vis[..., None], 3, axis=-1)
+
+    def _maybe_print_nav_debug(self, base_cmd: np.ndarray, nav_info: dict[str, Any]) -> None:
+        if self._step_count % 5 != 0:
             return
 
         goal_dist = float(nav_info.get("goal_dist", 0.0))
-        bin_dist = float(nav_info.get("bin_dist", 0.0))
         heading_error = float(nav_info.get("heading_error", 0.0))
         phase = str(nav_info.get("phase", "nav"))
         target = nav_info.get("target")
         target_id = None if target is None else target.get("id")
         target_class = None if target is None else target.get("class")
-        target_pos = None if target is None else target.get("pos_robot")
         target_dist = float(nav_info.get("target_dist", 0.0))
-        target_pos_text = None if target_pos is None else np.asarray(target_pos, dtype=np.float32).round(3).tolist()
-        stopped = phase == "stopped" or (goal_dist <= self.stop_tolerance and np.allclose(base_cmd[:2], 0.0))
-        print(
-            "[TaskB-TARGET] "
+        stopped = bool(nav_info.get("stopped", False))
+        
+        # 获取机器人世界坐标
+        robot_pos_world, robot_yaw, _ = self._resolve_robot_pose_world({}, {}, None)
+        
+        self._log(
+            "[NAV] "
             f"phase={phase} "
-            f"target_id={target_id} class={target_class} target_dist={target_dist:.3f} "
-            f"target_pos_robot={target_pos_text} "
-            f"base_cmd={np.asarray(base_cmd, dtype=np.float32).round(3).tolist()} "
-            f"goal_dist={goal_dist:.3f} bin_dist={bin_dist:.3f} "
-            f"heading_error={heading_error:.3f} stopped={stopped}",
-            flush=True,
+            f"target={target_id}:{target_class} "
+            f"dist={target_dist:.2f}m "
+            f"err={heading_error:.2f}rad "
+            f"goal={goal_dist:.2f}m "
+            f"cmd=[{base_cmd[0]:.2f}, {base_cmd[1]:.2f}, {base_cmd[2]:.2f}] "
+            f"robot=[{robot_pos_world[0]:.2f}, {robot_pos_world[1]:.2f}] yaw={robot_yaw:.2f}"
+        )
+        self._maybe_print_locked_target_gt_debug(nav_info)
+
+    def _get_object_index(self, obj_name: str) -> int | None:
+        obj_name_lower = str(obj_name).lower()
+        if "object" not in obj_name_lower:
+            return None
+        digits = "".join(ch for ch in obj_name_lower if ch.isdigit())
+        if not digits:
+            return None
+        obj_idx = int(digits)
+        if 1 <= obj_idx <= 18:
+            return obj_idx
+        return None
+
+    def _get_gt_objects(self) -> list[dict[str, Any]]:
+        if self.env is None:
+            return []
+
+        try:
+            scene = self._get_scene()
+            if scene is None:
+                return []
+
+            robot_pos_world, robot_yaw, _ = self._resolve_robot_pose_world({}, {}, None)
+            objects: list[dict[str, Any]] = []
+            obj_containers = []
+            if hasattr(scene, "rigid_objects"):
+                obj_containers.append(scene.rigid_objects)
+            if hasattr(scene, "articulations"):
+                obj_containers.append(scene.articulations)
+
+            for container in obj_containers:
+                for obj_name, obj_handle in container.items():
+                    obj_idx = self._get_object_index(obj_name)
+                    if obj_idx is None:
+                        continue
+                    try:
+                        if hasattr(obj_handle, "data") and hasattr(obj_handle.data, "root_pos_w"):
+                            pos_world = obj_handle.data.root_pos_w.cpu().numpy()[0]
+                        elif hasattr(obj_handle, "root_pos_w"):
+                            pos_world = obj_handle.root_pos_w.cpu().numpy()[0]
+                        else:
+                            continue
+                    except Exception:
+                        continue
+
+                    if obj_idx <= 6:
+                        obj_class = "sugar_box"
+                    elif obj_idx <= 12:
+                        obj_class = "mustard_bottle"
+                    else:
+                        obj_class = "banana"
+
+                    pos_world_np = np.asarray(pos_world, dtype=np.float32)
+                    pos_robot_np = self._world_to_robot_frame(pos_world_np, robot_pos_world, robot_yaw)
+                    objects.append({
+                        "id": obj_name,
+                        "class": obj_class,
+                        "pos_world": pos_world_np.tolist(),
+                        "pos_robot": pos_robot_np.tolist(),
+                        "dist_to_robot": float(np.linalg.norm(pos_robot_np[:2])),
+                    })
+            return objects
+        except Exception:
+            return []
+
+    def _match_gt_for_target(self, target: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not isinstance(target, dict):
+            return None
+        target_pos = target.get("pos_world")
+        if target_pos is None:
+            return None
+
+        target_pos_np = self._safe_numpy(target_pos, np.zeros(3, dtype=np.float32))
+        target_class = target.get("class")
+        gt_objects = self._get_gt_objects()
+        if not gt_objects:
+            return None
+
+        candidates = [obj for obj in gt_objects if target_class is None or obj.get("class") == target_class]
+        if not candidates:
+            candidates = gt_objects
+
+        best = min(
+            candidates,
+            key=lambda obj: float(
+                np.linalg.norm(
+                    self._safe_numpy(obj.get("pos_world"), np.zeros(3, dtype=np.float32))[:2] - target_pos_np[:2]
+                )
+            ),
+        )
+        return best
+
+    def _maybe_print_locked_target_gt_debug(self, nav_info: dict[str, Any]) -> None:
+        target = nav_info.get("target")
+        if not isinstance(target, dict):
+            target = self._locked_target
+        if not isinstance(target, dict):
+            return
+
+        gt_target = self._match_gt_for_target(target)
+        if gt_target is None:
+            return
+
+        perc_pos_w = self._safe_numpy(target.get("pos_world"), np.zeros(3, dtype=np.float32))
+        gt_pos_w = self._safe_numpy(gt_target.get("pos_world"), np.zeros(3, dtype=np.float32))
+        perc_pos_r = self._safe_numpy(target.get("pos_robot"), np.zeros(3, dtype=np.float32))
+        gt_pos_r = self._safe_numpy(gt_target.get("pos_robot"), np.zeros(3, dtype=np.float32))
+
+        pos_err_xy = gt_pos_w[:2] - perc_pos_w[:2]
+        pos_err_norm = float(np.linalg.norm(pos_err_xy))
+        perc_heading = float(math.atan2(perc_pos_r[1], perc_pos_r[0]))
+        gt_heading = float(math.atan2(gt_pos_r[1], gt_pos_r[0]))
+        heading_err = self._wrap_angle(perc_heading - gt_heading)
+
+        self._log(
+            "[GT-CMP] "
+            f"lock={target.get('id')}:{target.get('class')} "
+            f"perc_w=[{perc_pos_w[0]:.2f}, {perc_pos_w[1]:.2f}] "
+            f"gt={gt_target.get('id')}:{gt_target.get('class')} "
+            f"gt_w=[{gt_pos_w[0]:.2f}, {gt_pos_w[1]:.2f}] "
+            f"pos_err=[{pos_err_xy[0]:.2f}, {pos_err_xy[1]:.2f}] "
+            f"|err|={pos_err_norm:.2f}m "
+            f"heading perc={perc_heading:.2f} gt={gt_heading:.2f} diff={heading_err:.2f}rad"
         )
 
-    def predicts(self, obs, current_score):
-        self._step_count += 1
-        nav_input, target = self._get_navigation_input(obs)
+    def _select_grasp_target(
+        self,
+        target_nav: dict[str, Any] | None,
+        target_grasp: dict[str, Any] | None,
+        perception_output: dict[str, Any] | None,
+        robot_pos_world: np.ndarray,
+        robot_yaw: float,
+    ) -> dict[str, Any] | None:
+        if target_nav is None:
+            return None
 
-        if self._step_count <= self.stand_still_steps:
-            base_cmd = np.zeros(3, dtype=np.float32)
-            nav_info = {"phase": "stand", "goal_dist": 0.0, "bin_dist": 0.0, "heading_error": 0.0, "target": target}
-        elif self.target_mode == "object" and target is not None:
-            base_cmd, nav_info = self._compute_object_cmd(target)
-        elif self.target_mode == "object":
-            base_cmd = np.zeros(3, dtype=np.float32)
-            nav_info = {"phase": "search", "goal_dist": 0.0, "bin_dist": 0.0, "heading_error": 0.0, "target": None}
-        else:
-            base_cmd, nav_info = self._compute_base_cmd(nav_input)
-            nav_info["phase"] = "nav"
+        tracked_pos = self._safe_numpy(target_nav.get("pos_world"), np.zeros(3, dtype=np.float32))
+        tracked_class = target_nav.get("class")
+        candidates: list[dict[str, Any]] = []
 
-        self._last_base_cmd = base_cmd
-        self._maybe_print_nav_debug(base_cmd, nav_info)
+        if isinstance(perception_output, dict):
+            head_candidates = self._normalize_camera_objects(
+                perception_output.get("head_objects", []),
+                "head",
+                robot_pos_world,
+                robot_yaw,
+            )
+            ee_candidates = self._normalize_camera_objects(
+                perception_output.get("ee_objects", []),
+                "ee",
+                robot_pos_world,
+                robot_yaw,
+            )
+            candidates.extend(head_candidates)
+            candidates.extend(ee_candidates)
+
+        if target_grasp is not None:
+            candidates.insert(0, target_grasp)
+
+        compatible: list[dict[str, Any]] = []
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            if tracked_class is not None and candidate.get("class") not in {None, tracked_class}:
+                continue
+            candidate_pos = candidate.get("pos_world")
+            if candidate_pos is None:
+                continue
+            candidate_pos_np = self._safe_numpy(candidate_pos, np.zeros(3, dtype=np.float32))
+            if float(np.linalg.norm(candidate_pos_np[:2] - tracked_pos[:2])) <= self.target_near_match_radius * 2.0:
+                compatible.append(candidate)
+
+        if compatible:
+            return min(
+                compatible,
+                key=lambda candidate: float(
+                    np.linalg.norm(
+                        self._safe_numpy(candidate.get("pos_world"), np.zeros(3, dtype=np.float32))[:2]
+                        - tracked_pos[:2]
+                    )
+                ),
+            )
+
+        fallback = dict(target_nav)
+        if fallback.get("grasp_pos_world") is None:
+            fallback["grasp_pos_world"] = tracked_pos.tolist()
+        return fallback
+
+    def _policy_action_from_base_cmd(self, obs: dict[str, Any], base_cmd: np.ndarray) -> torch.Tensor:
         policy_obs = self._extract_policy_obs(obs, base_cmd)
-
         with torch.inference_mode():
             action_train = self.actor(policy_obs)
-
         if not isinstance(action_train, torch.Tensor):
             action_train = torch.as_tensor(action_train, device=self.device, dtype=torch.float32)
-
         if action_train.ndim == 1:
             action_train = action_train.unsqueeze(0)
+        
+        # 记录并裁剪 policy action 到合理范围 [-1, 1]
+        raw_policy_action = action_train[0, :3].cpu().numpy()
+        clipped_policy_action = np.clip(raw_policy_action, -1.0, 1.0)
+        self._last_policy_action = clipped_policy_action
+        
+        return self._map_policy_action_to_env_action(action_train)
 
-        action_env = self._map_policy_action_to_env_action(action_train)
+    def _start_grasp_if_possible(self, target_grasp: dict[str, Any] | None) -> bool:
+        if target_grasp is None:
+            return False
+        controller = self._ensure_arm_grasp_controller()
+        if controller is None:
+            self._log("[TaskB-GRASP] controller unavailable, skip grasp start.")
+            return False
+        grasp_pos_world = target_grasp.get("grasp_pos_world") or target_grasp.get("pos_world")
+        if grasp_pos_world is None:
+            self._log("[TaskB-GRASP] missing grasp_pos_world, skip grasp start.")
+            return False
+        current_ee_quat_w = controller.get_ee_pose()[1]
+        controller.start_grasp(target_grasp, grasp_pos_world, current_ee_quat_w=current_ee_quat_w)
+        grasp_quat_world = target_grasp.get("grasp_quat_world")
+        if grasp_quat_world is not None:
+            controller.target_ee_quat_w = np.asarray(grasp_quat_world, dtype=np.float32).copy()
+        self._pending_grasp_target = dict(target_grasp)
+        self._task_state = "GRASP_OBJECT"
+        self._log(
+            "[TaskB-GRASP] start "
+            f"id={target_grasp.get('id')} class={target_grasp.get('class')} "
+            f"grasp_pos_world={np.asarray(grasp_pos_world, dtype=np.float32).round(3).tolist()}"
+        )
+        return True
+
+    def predicts(self, obs, current_score):
+        del current_score
+        self._step_count += 1
+        local_nav = self._update_local_odometry(obs)
+        perception_output, robot_pos_world, robot_yaw, pose_source = self._get_perception_output(obs, local_nav)
+        self._last_perception_output = perception_output
+        self._print_perception_targets(perception_output, robot_pos_world, robot_yaw, pose_source)
+
+        nav_input = None
+        target_nav = None
+        target_grasp = None
+        if isinstance(perception_output, dict):
+            target_grasp = self._prepare_pipeline_object(
+                perception_output.get("target_grasp"),
+                str((perception_output.get("grasp") or {}).get("camera", "head")),
+                robot_pos_world,
+                robot_yaw,
+            )
+            tracked_dist = float("inf")
+            if self._tracked_target is not None:
+                tracked_pos = self._safe_numpy(self._tracked_target.get("filtered_pos_world"), np.zeros(3, dtype=np.float32))
+                tracked_robot = self._world_to_robot_frame(tracked_pos, robot_pos_world, robot_yaw)
+                tracked_dist = float(np.linalg.norm(tracked_robot[:2]))
+            if tracked_dist <= self.target_near_range:
+                perception_output["phase"] = "grasp"
+            nav_input, target_nav = self._adapt_perception_output(obs, local_nav, perception_output)
+
+        base_cmd = np.zeros(3, dtype=np.float32)
+        nav_info = self._make_pipeline_nav_info(perception_output, pose_source, target_nav, phase="idle", stopped=True)
+        action_env: torch.Tensor | None = None
+
+        if self._step_count <= self.stand_still_steps:
+            # 在 stand 期间也计算导航信息，但不执行移动
+            nav_info["phase"] = "stand"
+            if target_nav is not None:
+                _, nav_info = self._compute_nav_cmd_from_target_nav(target_nav)
+                nav_info["phase"] = "stand"
+                nav_info["stopped"] = True
+        elif self._task_state == "GRASP_OBJECT":
+            robot = self._get_robot()
+            scene = self._get_scene()
+            controller = self._ensure_arm_grasp_controller()
+            action_env = self._policy_action_from_base_cmd(obs, np.zeros(3, dtype=np.float32))
+            nav_info = self._make_pipeline_nav_info(
+                perception_output,
+                pose_source,
+                self._pending_grasp_target,
+                phase="grasping",
+                stopped=True,
+            )
+            if controller is None or robot is None:
+                self._log("[TaskB-GRASP] robot/controller unavailable during grasp, fallback to approach.")
+                self._task_state = "APPROACH_OBJECT"
+                self._pending_grasp_target = None
+                self._clear_frozen_pregrasp()
+            else:
+                done, success = controller.step(robot, scene, self.dt)
+                action_env = controller.apply_to_action_tensor(action_env, robot)
+                if done:
+                    if success:
+                        self._task_state = "NAV_TO_BIN"
+                        self._log("[TaskB-GRASP] success, switching to NAV_TO_BIN")
+                    else:
+                        self._task_state = "APPROACH_OBJECT"
+                        self._log("[TaskB-GRASP] failed, switching back to APPROACH_OBJECT")
+                        self._pending_grasp_target = None
+                        self._clear_locked_target()
+        elif self._task_state == "NAV_TO_BIN":
+            bin_nav_input = {
+                "robot": {"pos_world": robot_pos_world.tolist(), "yaw": float(robot_yaw)},
+                "bin": {"center_world": self.default_bin_center.tolist()},
+            }
+            base_cmd, nav_info = self._compute_base_cmd(bin_nav_input)
+            nav_info = self._make_pipeline_nav_info(
+                perception_output,
+                pose_source,
+                self._pending_grasp_target,
+                phase="nav_to_bin",
+                stopped=bool(nav_info.get("stopped", False)),
+                extra=nav_info,
+            )
+            if float(nav_info.get("bin_dist", float("inf"))) <= self.bin_drop_radius:
+                self._task_state = "RELEASE_OBJECT"
+                self._release_step_count = 0
+                base_cmd = np.zeros(3, dtype=np.float32)
+                nav_info["phase"] = "at_bin"
+                nav_info["stopped"] = True
+                self._log("[TaskB-BIN] reached bin area, switching to RELEASE_OBJECT")
+        elif self._task_state == "RELEASE_OBJECT":
+            robot = self._get_robot()
+            controller = self._ensure_arm_grasp_controller()
+            action_env = self._policy_action_from_base_cmd(obs, np.zeros(3, dtype=np.float32))
+            nav_info = self._make_pipeline_nav_info(
+                perception_output,
+                pose_source,
+                self._pending_grasp_target,
+                phase="release",
+                stopped=True,
+            )
+            if controller is not None and robot is not None:
+                controller.open_gripper()
+                action_env = controller.apply_to_action_tensor(action_env, robot)
+            self._release_step_count += 1
+            if self._release_step_count >= self.release_steps:
+                if controller is not None:
+                    controller.reset()
+                self._task_state = "APPROACH_OBJECT"
+                self._pending_grasp_target = None
+                self._clear_locked_target()
+                self._release_step_count = 0
+                self._log("[TaskB-BIN] release finished, switching back to APPROACH_OBJECT")
+        else:
+            self._task_state = "APPROACH_OBJECT"
+            if target_nav is not None:
+                base_cmd, nav_info = self._compute_nav_cmd_from_target_nav(target_nav)
+                if nav_input is not None:
+                    nav_info = self._attach_nav_debug_context(nav_info, nav_input, target_nav)
+                else:
+                    nav_info = self._make_pipeline_nav_info(
+                        perception_output,
+                        pose_source,
+                        target_nav,
+                        phase=str(nav_info.get("phase", "approach")),
+                        stopped=bool(nav_info.get("stopped", False)),
+                        extra=nav_info,
+                    )
+                perception_phase = None if perception_output is None else str(perception_output.get("phase", "approach"))
+                matched_grasp_target = self._select_grasp_target(
+                    target_nav,
+                    target_grasp,
+                    perception_output,
+                    robot_pos_world,
+                    robot_yaw,
+                )
+                if (
+                    nav_info.get("phase") == "ready_to_grasp"
+                    and matched_grasp_target is not None
+                    and (
+                        target_nav.get("source_camera") == "head"
+                        or perception_phase == "grasp"
+                        or self._safe_float(target_nav.get("dist_to_robot"), fallback=float("inf")) <= self.grasp_start_depth
+                    )
+                ):
+                    base_cmd = np.zeros(3, dtype=np.float32)
+                    nav_info["phase"] = "start_grasp"
+                    nav_info["stopped"] = True
+                    self._start_grasp_if_possible(matched_grasp_target)
+            else:
+                base_cmd = np.array([0.0, 0.0, self.search_yaw_rate], dtype=np.float32)
+                search_phase = "searching_lost_target" if self._tracked_target is not None else "search"
+                nav_info = self._make_pipeline_nav_info(
+                    perception_output,
+                    pose_source,
+                    None,
+                    phase=search_phase,
+                    stopped=False,
+                    extra={"goal_dist": 0.0, "heading_error": 0.0, "target_dist": 0.0},
+                )
+
+        if action_env is None:
+            action_env = self._policy_action_from_base_cmd(obs, base_cmd)
+
+        self._last_base_cmd = base_cmd
+        self._last_nav_info = nav_info
+        self._maybe_print_nav_debug(base_cmd, nav_info)
+        self._maybe_show_rgb_debug(obs, nav_info)
         return {"action": action_env.cpu().numpy().tolist(), "giveup": False}
 
 
@@ -476,11 +2269,13 @@ if __name__ == "__main__":
         "image": {
             "head_rgb": torch.zeros(1, 480, 640, 3, dtype=torch.uint8),
             "head_depth": torch.ones(1, 480, 640, 1, dtype=torch.float32),
+            "ee_rgb": torch.zeros(1, 480, 640, 3, dtype=torch.uint8),
+            "ee_depth": torch.ones(1, 480, 640, 1, dtype=torch.float32),
         },
     }
     try:
         result = solution.predicts(dummy_obs, current_score=0.0)
-        print("action_dim", len(result["action"][0]))
-        print("giveup", result["giveup"])
+        solution._log(f"action_dim {len(result['action'][0])}")
+        solution._log(f"giveup {result['giveup']}")
     except Exception as exc:
-        print(type(exc).__name__, exc)
+        solution._log(f"{type(exc).__name__} {exc}")

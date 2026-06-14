@@ -32,6 +32,7 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser):
     arg_group.add_argument(
         "--log_project_name", type=str, default=None, help="Name of the logging project when using wandb or neptune."
     )
+    arg_group.add_argument("--no_wandb", action="store_true", default=False, help="Disable wandb logging.")
 
 
 def parse_rsl_rl_cfg(task_name: str, args_cli: argparse.Namespace) -> RslRlBaseRunnerCfg:
@@ -82,5 +83,8 @@ def update_rsl_rl_cfg(agent_cfg: RslRlBaseRunnerCfg, args_cli: argparse.Namespac
     if agent_cfg.logger in {"wandb", "neptune"} and args_cli.log_project_name:
         agent_cfg.wandb_project = args_cli.log_project_name
         agent_cfg.neptune_project = args_cli.log_project_name
+    # disable wandb if --no_wandb is specified
+    if args_cli.no_wandb:
+        agent_cfg.logger = "tensorboard"
 
     return agent_cfg

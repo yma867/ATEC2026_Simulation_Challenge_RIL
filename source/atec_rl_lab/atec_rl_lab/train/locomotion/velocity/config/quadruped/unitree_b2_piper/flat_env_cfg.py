@@ -9,7 +9,7 @@ class UnitreeB2PiperFlatEnvCfg(UnitreeB2PiperRoughEnvCfg):
         # post init of parent
         super().__post_init__()
 
-        # override rewards
+        # override rewards - base_height_l2 doesn't need sensor in flat terrain
         self.rewards.base_height_l2.params["sensor_cfg"] = None
         # change terrain to flat
         self.scene.terrain.terrain_type = "plane"

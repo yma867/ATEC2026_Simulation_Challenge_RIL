@@ -182,3 +182,45 @@ class DiscreteCommandControllerCfg(CommandTermCfg):
     List of available discrete commands, where each element is an integer.
     Example: [10, 20, 30, 40, 50]
     """
+
+
+class UniformScalarCommand(CommandTerm):
+    """Command generator that samples one scalar command per environment from a uniform range."""
+
+    cfg: UniformScalarCommandCfg
+    """The configuration of the command generator."""
+
+    def __init__(self, cfg: UniformScalarCommandCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+        self.command_buffer = torch.zeros(self.num_envs, 1, device=self.device)
+
+    @property
+    def command(self) -> torch.Tensor:
+        """Return the scalar command tensor. Shape is (num_envs, 1)."""
+        return self.command_buffer
+
+    def _update_metrics(self):
+        """No additional metrics are tracked for the scalar command."""
+        return
+
+    def _resample_command(self, env_ids: Sequence[int]):
+        self.command_buffer[env_ids, 0].uniform_(*self.cfg.ranges.value)
+
+    def _update_command(self):
+        """The scalar command is already fully defined during resampling."""
+        return
+
+
+@configclass
+class UniformScalarCommandCfg(CommandTermCfg):
+    """Configuration for the uniform scalar command generator."""
+
+    class_type: type = UniformScalarCommand
+
+    @configclass
+    class Ranges:
+        """Uniform distribution ranges for the scalar command."""
+
+        value: tuple[float, float] = (0.0, 0.0)
+
+    ranges: Ranges = Ranges()

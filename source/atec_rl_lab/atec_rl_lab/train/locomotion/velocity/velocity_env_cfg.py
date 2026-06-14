@@ -15,6 +15,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
+from atec_rl_lab.tasks.task_base import BetterTerrainImporter
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
@@ -38,6 +39,7 @@ class MySceneCfg(InteractiveSceneCfg):
 
     # ground terrain
     terrain = TerrainImporterCfg(
+        class_type=BetterTerrainImporter,
         prim_path="/World/ground",
         terrain_type="generator",
         terrain_generator=ROUGH_TERRAINS_CFG,
@@ -108,6 +110,11 @@ class CommandsCfg:
             lin_vel_x=(-1.0, 1.0), lin_vel_y=(-1.0, 1.0), ang_vel_z=(-1.0, 1.0), heading=(-math.pi, math.pi)
         ),
     )
+    base_height = mdp.UniformScalarCommandCfg(
+        resampling_time_range=(10.0, 10.0),
+        debug_vis=False,
+        ranges=mdp.UniformScalarCommandCfg.Ranges(value=(0.30, 0.53)),
+    )
 
 
 @configclass
@@ -149,6 +156,12 @@ class ObservationsCfg:
         velocity_commands = ObsTerm(
             func=mdp.generated_commands,
             params={"command_name": "base_velocity"},
+            clip=(-100.0, 100.0),
+            scale=1.0,
+        )
+        base_height_command = ObsTerm(
+            func=mdp.generated_commands,
+            params={"command_name": "base_height"},
             clip=(-100.0, 100.0),
             scale=1.0,
         )
@@ -206,6 +219,12 @@ class ObservationsCfg:
         velocity_commands = ObsTerm(
             func=mdp.generated_commands,
             params={"command_name": "base_velocity"},
+            clip=(-100.0, 100.0),
+            scale=1.0,
+        )
+        base_height_command = ObsTerm(
+            func=mdp.generated_commands,
+            params={"command_name": "base_height"},
             clip=(-100.0, 100.0),
             scale=1.0,
         )
@@ -382,6 +401,7 @@ class RewardsCfg:
             "asset_cfg": SceneEntityCfg("robot", body_names=""),
             "sensor_cfg": SceneEntityCfg("height_scanner_base"),
             "target_height": 0.0,
+            "command_name": None,
         },
     )
     body_lin_acc_l2 = RewTerm(
@@ -650,10 +670,21 @@ class TerminationsCfg:
         time_out=True,
     )
 
-    # Contact sensor
+    # Contact sensor (detect contact with body and thigh)
     illegal_contact = DoneTerm(
         func=mdp.illegal_contact,
-        params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=""), "threshold": 1.0},
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_forces", 
+                body_names=[
+                    "base_link", "gripper_base", "arm_base", 
+                    "arm_link1", "arm_link2", "arm_link3", "arm_link4", 
+                    "arm_link5", "arm_link6", "arm_link7", "arm_link8",
+                    "FL_thigh", "FR_thigh", "RL_thigh", "RR_thigh"
+                ]
+            ), 
+            "threshold": 1.0
+        },
     )
 
 

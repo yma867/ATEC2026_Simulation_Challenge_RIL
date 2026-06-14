@@ -1,8 +1,10 @@
 # Reference: based on unitree_b2/rough_env_cfg.py
 
 from isaaclab.utils import configclass
+from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import SceneEntityCfg
 
-
+import atec_rl_lab.train.locomotion.velocity.mdp as mdp
 from atec_rl_lab.train.locomotion.velocity.velocity_env_cfg import LocomotionVelocityRoughEnvCfg
 
 from atec_rl_lab.assets.robots import UNITREE_B2_PIPER_CFG
@@ -22,6 +24,17 @@ class UnitreeB2PiperRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         # ------------------------------Scene------------------------------
         # use the combined B2 + Piper USD asset
         self.scene.robot = UNITREE_B2_PIPER_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+        # 设置机械臂初始位置（与 solution_gt.py 保持一致）
+        self.scene.robot.init_state.joint_pos.update({
+            "arm_joint1": 0.0,
+            "arm_joint2": 2.13,
+            "arm_joint3": -1.20,
+            "arm_joint4": 0.0,
+            "arm_joint5": -0.8,
+            "arm_joint6": 0.0,
+            "arm_joint7": 0.0,
+            "arm_joint8": 0.0,
+        })
         self.scene.height_scanner.prim_path = "{ENV_REGEX_NS}/Robot/" + self.base_link_name
         self.scene.height_scanner_base.prim_path = "{ENV_REGEX_NS}/Robot/" + self.base_link_name
 
@@ -47,9 +60,12 @@ class UnitreeB2PiperRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
                 "x": (-0.5, 0.5),
                 "y": (-0.5, 0.5),
                 "z": (0.0, 0.2),
-                "roll": (-3.14, 3.14),
-                "pitch": (-3.14, 3.14),
-                "yaw": (-3.14, 3.14),
+                "roll": (-0.5, 0.5),
+                "pitch": (-0.5, 0.5),
+                "yaw": (-0.5, 0.5),
+                # "roll": (-3.14, 3.14),
+                # "pitch": (-3.14, 3.14),
+                # "yaw": (-3.14, 3.14),
             },
             "velocity_range": {
                 "x": (-0.5, 0.5),
@@ -65,6 +81,12 @@ class UnitreeB2PiperRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
             f"^(?!.*{self.base_link_name}).*"
         ]
         self.events.randomize_com_positions.params["asset_cfg"].body_names = [self.base_link_name]
+        self.events.randomize_reset_joints.params["asset_cfg"] = SceneEntityCfg("robot", joint_names=self.joint_names)
+        self.events.reset_arm_joints_to_default = EventTerm(
+            func=mdp.reset_joints_and_targets_to_default,
+            mode="reset",
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=UNITREE_B2_PIPER_CFG.arm_joint_names)},
+        )
         self.events.randomize_apply_external_force_torque.params["asset_cfg"].body_names = [self.base_link_name]
         self.events.randomize_apply_external_force_torque.params["force_range"] = (-30.0, 30.0)
         self.events.randomize_apply_external_force_torque.params["torque_range"] = (-10.0, 10.0)
@@ -75,12 +97,12 @@ class UnitreeB2PiperRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.lin_vel_z_l2.weight = -2.0
         self.rewards.ang_vel_xy_l2.weight = -0.05
         self.rewards.flat_orientation_l2.weight = 0
-        self.rewards.base_height_l2.weight = 0
-        self.rewards.base_height_l2.params["target_height"] = 0.53
+        self.rewards.base_height_l2.weight = -5.0
+        self.rewards.base_height_l2.params["command_name"] = "base_height"
         self.rewards.base_height_l2.params["asset_cfg"].body_names = [self.base_link_name]
         self.rewards.body_lin_acc_l2.weight = 0
 
-        # Joint penalties
+        # Joint penaltiess
         self.rewards.joint_torques_l2.weight = -1e-5
         self.rewards.joint_vel_l2.weight = 0
         self.rewards.joint_acc_l2.weight = -1e-7
@@ -107,6 +129,8 @@ class UnitreeB2PiperRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         # Velocity-tracking rewards
         self.rewards.track_lin_vel_xy_exp.weight = 3.0
         self.rewards.track_ang_vel_z_exp.weight = 1.5
+        self.rewards.track_lin_vel_xy_exp.params["std"] = 0.6
+        self.rewards.track_ang_vel_z_exp.params["std"] = 0.6
 
         # Others
         self.rewards.feet_air_time.weight = 0
@@ -136,7 +160,7 @@ class UnitreeB2PiperRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
             self.disable_zero_weight_rewards()
 
         # ------------------------------Terminations------------------------------
-        self.terminations.illegal_contact = None
+        #self.terminations.illegal_contact = None
 
         # ------------------------------Curriculums------------------------------
         self.curriculum.command_levels_lin_vel = None

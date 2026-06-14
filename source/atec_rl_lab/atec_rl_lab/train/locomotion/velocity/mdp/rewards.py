@@ -614,7 +614,8 @@ def upward(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("r
 
 def base_height_l2(
     env: ManagerBasedRLEnv,
-    target_height: float,
+    target_height: float | None = None,
+    command_name: str | None = None,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     sensor_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
@@ -626,6 +627,13 @@ def base_height_l2(
     """
     # extract the used quantities (to enable type-hinting)
     asset: RigidObject = env.scene[asset_cfg.name]
+    if command_name is not None:
+        desired_height = env.command_manager.get_command(command_name).squeeze(-1)
+    elif target_height is not None:
+        desired_height = torch.full((env.num_envs,), target_height, device=env.device)
+    else:
+        raise ValueError("Either target_height or command_name must be provided for base_height_l2.")
+
     if sensor_cfg is not None:
         sensor: RayCaster = env.scene[sensor_cfg.name]
         # Adjust the target height using the sensor data
@@ -633,10 +641,10 @@ def base_height_l2(
         if torch.isnan(ray_hits).any() or torch.isinf(ray_hits).any() or torch.max(torch.abs(ray_hits)) > 1e6:
             adjusted_target_height = asset.data.root_link_pos_w[:, 2]
         else:
-            adjusted_target_height = target_height + torch.mean(ray_hits, dim=1)
+            adjusted_target_height = desired_height + torch.mean(ray_hits, dim=1)
     else:
         # Use the provided target height directly for flat terrain
-        adjusted_target_height = target_height
+        adjusted_target_height = desired_height
     # Compute the L2 squared penalty
     reward = torch.square(asset.data.root_pos_w[:, 2] - adjusted_target_height)
     reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b[:, 2], 0, 0.7) / 0.7

@@ -268,3 +268,24 @@ def reset_root_state_uniform(
         # set into the physics simulation
         asset.write_root_pose_to_sim(torch.cat([positions, orientations], dim=-1), env_ids=non_pit_env_ids)
         asset.write_root_velocity_to_sim(velocities, env_ids=non_pit_env_ids)
+
+
+def reset_joints_and_targets_to_default(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+):
+    """Reset selected joints and align their implicit actuator targets with the default pose."""
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    if asset_cfg.joint_ids != slice(None):
+        iter_env_ids = env_ids[:, None]
+    else:
+        iter_env_ids = env_ids
+
+    joint_pos = asset.data.default_joint_pos[iter_env_ids, asset_cfg.joint_ids].clone()
+    joint_vel = asset.data.default_joint_vel[iter_env_ids, asset_cfg.joint_ids].clone()
+
+    asset.write_joint_state_to_sim(joint_pos, joint_vel, joint_ids=asset_cfg.joint_ids, env_ids=env_ids)
+    asset.set_joint_position_target(joint_pos, joint_ids=asset_cfg.joint_ids, env_ids=env_ids)
+    asset.set_joint_velocity_target(joint_vel, joint_ids=asset_cfg.joint_ids, env_ids=env_ids)

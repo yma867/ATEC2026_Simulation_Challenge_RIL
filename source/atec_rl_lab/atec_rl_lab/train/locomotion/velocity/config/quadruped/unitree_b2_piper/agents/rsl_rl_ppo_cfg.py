@@ -11,6 +11,9 @@ class UnitreeB2PiperRoughPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     max_iterations = 20000
     save_interval = 100
     experiment_name = "unitree_b2_piper_rough"
+    # Enable wandb logging
+    logger = "wandb"
+    wandb_project = "atec_2026_simulation_challenge"
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
         actor_obs_normalization=False,
@@ -40,5 +43,8 @@ class UnitreeB2PiperFlatPPORunnerCfg(UnitreeB2PiperRoughPPORunnerCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        self.max_iterations = 5000
+        self.max_iterations = 7000
         self.experiment_name = "unitree_b2_piper_flat"
+        # Enable wandb logging
+        self.logger = "wandb"
+        self.wandb_project = "atec_2026_simulation_challenge"

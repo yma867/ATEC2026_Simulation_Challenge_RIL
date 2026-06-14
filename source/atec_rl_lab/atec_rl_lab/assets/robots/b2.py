@@ -79,6 +79,17 @@ UNITREE_B2_CFG = ATECArticulationCfg(
 UNITREE_B2_PIPER_CFG = deepcopy(UNITREE_B2_CFG)
 UNITREE_B2_PIPER_CFG.spawn.articulation_props.enabled_self_collisions = False
 UNITREE_B2_PIPER_CFG.spawn.usd_path = str(B2_PIPER_USD_PATH)
+# 设置机械臂初始位置
+UNITREE_B2_PIPER_CFG.init_state.joint_pos.update({
+    "arm_joint1": 0.0,
+    "arm_joint2": 2.13,
+    "arm_joint3": -1.20,
+    "arm_joint4": 0.0,
+    "arm_joint5": -0.8,
+    "arm_joint6": 0.0,
+    "arm_joint7": 0.0,
+    "arm_joint8": 0.0,
+})
 UNITREE_B2_PIPER_CFG.actuators["arms"] = ImplicitActuatorCfg(
     joint_names_expr="arm_joint.*",
     effort_limit_sim=100.0,

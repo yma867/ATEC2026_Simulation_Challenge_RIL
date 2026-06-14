@@ -35,6 +35,12 @@ parser.add_argument(
     default=False,
     help="Enable GT navigation mode (directly read object positions from simulation).",
 )
+parser.add_argument(
+    "--wbc",
+    action="store_true",
+    default=False,
+    help="Enable WBC mode (use WBC to control the robot).",
+)
 
 # Isaac Sim / Kit args
 AppLauncher.add_app_launcher_args(parser)
@@ -72,6 +78,22 @@ def play() -> tuple[float, float]:
 
     is_task_e = isinstance(args_cli.task, str) and args_cli.task.startswith("ATEC-TaskE")
     # -------------------------------------------------------------------------
+    # Initialize solution (dynamic import based on --gt_nav flag)
+    # -------------------------------------------------------------------------
+    global solution
+    if args_cli.gt_nav:
+        print("[INFO] Enabling GT Navigation mode")
+        from demo.solution_gt import AlgSolution
+        solution = AlgSolution(env=None)
+    else:
+        from demo.solution import AlgSolution
+        solution = AlgSolution(env=None)
+
+    # TODO: simulate getting action spec from jason string (e.g. from a file or network)
+    action_spec = solution.get_action_spec() if hasattr(solution, "get_action_spec") else None
+    action_spec_json = json.dumps(action_spec) if action_spec else None
+
+    # -------------------------------------------------------------------------
     # Create env (plain Gym env)
     # -------------------------------------------------------------------------
     env_cfg = parse_env_cfg(
@@ -81,46 +103,28 @@ def play() -> tuple[float, float]:
         use_fabric=not args_cli.disable_fabric
     )
 
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
-
-    # Convert MARL -> single agent if needed (kept from your original script)
-    if isinstance(env.unwrapped, DirectMARLEnv):
-        env = multi_agent_to_single_agent(env)
-
-    # -------------------------------------------------------------------------
-    # Optional: video wrapper
-    # -------------------------------------------------------------------------
-    if args_cli.video:
-        # Put videos in ./logs/videos/play by default (edit as you like)
-        video_kwargs = {
-            "video_folder": os.path.abspath(os.path.join("logs", "videos", args_cli.task, "play")),
-            "step_trigger": lambda step: step == 0,
-            "video_length": args_cli.video_length,
-            "disable_logger": True,
-        }
-        print("[INFO] Recording videos during play.")
-        print_dict(video_kwargs, nesting=4)
-        env = gym.wrappers.RecordVideo(env, **video_kwargs)
-
-    # -------------------------------------------------------------------------
-    # Initialize solution (dynamic import based on --gt_nav flag)
-    # -------------------------------------------------------------------------
-    global solution
-    if args_cli.gt_nav:
-        print("[INFO] Enabling GT Navigation mode")
-        from demo.solution_gt import AlgSolution
-        solution = AlgSolution(env=env)
-    else:
-        from demo.solution import AlgSolution
-        solution = AlgSolution()
-
-    # TODO: simulate getting action spec from jason string (e.g. from a file or network)
-    action_spec = solution.get_action_spec() if hasattr(solution, "get_action_spec") else None
-    action_spec_json = json.dumps(action_spec) if action_spec else None
-
     # New Feature: apply safe action spec to env config (e.g. for scaling/clipping actions from your solution)
     if action_spec_json:
         env_cfg = apply_safe_action_spec(env_cfg, action_spec_json)
+
+    def make_env(current_env_cfg):
+        env_inst = gym.make(args_cli.task, cfg=current_env_cfg, render_mode="rgb_array" if args_cli.video else None)
+        if isinstance(env_inst.unwrapped, DirectMARLEnv):
+            env_inst = multi_agent_to_single_agent(env_inst)
+        if args_cli.video:
+            video_kwargs = {
+                "video_folder": os.path.abspath(os.path.join("logs", "videos", args_cli.task, "play")),
+                "step_trigger": lambda step: step == 0,
+                "video_length": args_cli.video_length,
+                "disable_logger": True,
+            }
+            print("[INFO] Recording videos during play.")
+            print_dict(video_kwargs, nesting=4)
+            env_inst = gym.wrappers.RecordVideo(env_inst, **video_kwargs)
+        return env_inst
+
+    env = make_env(env_cfg)
+    solution.env = env
 
     # -------------------------------------------------------------------------
     # Reset
@@ -147,7 +151,10 @@ def play() -> tuple[float, float]:
             actions = resp["action"]
             actions = torch.tensor(actions, dtype=torch.float32, device='cuda').view(1, -1)
             obs, reward, terminated, truncated, info = env.step(actions)
-            if not is_task_e:
+            # 视角跟随：尊重 solution 中的 camera_follow_enabled 开关
+            #  在 demo/solution_gt.py 顶部修改 ATEC_CAMERA_FOLLOW_ROBOT 或设置
+            #   ATEC_TASKB_CAMERA_FOLLOW=1 来启用视角跟随
+            if not is_task_e and getattr(solution, "camera_follow_enabled", True):
                 camera_follow(env)
 
             sim_dt = info["Step_dt"]

@@ -102,22 +102,9 @@ class BetterTerrainImporter(TerrainImporter):
         # store the mesh name
         self.terrain_prim_paths.append(prim_path)
 
-        # obtain ground plane color from the configured visual material
-        color = (0.0, 0.0, 0.0)
-        if self.cfg.visual_material is not None:
-            material = self.cfg.visual_material.to_dict()
-            # defaults to the `GroundPlaneCfg` color if diffuse color attribute is not found
-            if "diffuse_color" in material:
-                color = material["diffuse_color"]
-            else:
-                logger.warning(
-                    "Visual material specified for ground plane but no diffuse color found."
-                    " Using default color: (0.0, 0.0, 0.0)"
-                )
-
-        # get the mesh
-        ground_plane_cfg = GroundPlaneCfg(physics_material=self.cfg.physics_material, size=size, color=color)
-        ground_plane_cfg.func(prim_path, ground_plane_cfg)
+        # directly add reference to our local default_environment.usd file
+        from isaaclab.sim.utils.prims import add_usd_reference
+        add_usd_reference(prim_path=prim_path, usd_path=f"{ATEC_ASSETS_MODEL_DIR}/scene/plane/default_environment.usd")
 
 @configclass
 class GroundPlaneCfg(SpawnerCfg):
