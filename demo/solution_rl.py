@@ -25,9 +25,9 @@ from rgbd_pure_dual_pipeline import RgbdPureDualPipeline
 from rgbd_utils import depth_to_vis, parse_ee_rgbd, parse_head_rgbd, depth_stats
 
 try:
-    from .solution_gt import ArmGraspController
+    from .solution_gt import ArmGraspController, LegPostureController
 except Exception:
-    from solution_gt import ArmGraspController
+    from solution_gt import ArmGraspController, LegPostureController
 
 from atec_rl_lab.assets.robots.b2 import UNITREE_B2_PIPER_CFG
 
@@ -84,6 +84,26 @@ class AlgSolution:
         self._release_step_count = 0
         self._arm_grasp_controller = None
         self._arm_controller_init_failed = False
+        self._leg_posture_controller = LegPostureController(
+            leg_joint_names=list(B2_PIPER_LEG_JOINT_NAMES),
+            crouch_drop_height=float(os.getenv("ATEC_TASKB_CROUCH_DROP_HEIGHT", "0.10")),
+            crouch_duration=float(os.getenv("ATEC_TASKB_CROUCH_DURATION", "2.0")),
+            stand_up_duration=float(os.getenv("ATEC_TASKB_STAND_UP_DURATION", "2.0")),
+            foot_pos_tol=float(os.getenv("ATEC_TASKB_CROUCH_FOOT_TOL", "0.1")),
+            body_height_tol=float(os.getenv("ATEC_TASKB_CROUCH_HEIGHT_TOL", "0.02")),
+            ik_damping=float(os.getenv("ATEC_TASKB_CROUCH_IK_DAMPING", "0.1")),
+            max_joint_step=float(os.getenv("ATEC_TASKB_CROUCH_MAX_JOINT_STEP", "0.08")),
+        )
+        self._pending_grasp_status = None
+        self.sit_down_actor = None
+        self.sit_down_actor_obs_dim = None
+        self.sit_down_min_steps = max(1, int(os.getenv("ATEC_TASKB_SIT_DOWN_MIN_STEPS", "30")))
+        self.sit_down_stable_steps_required = max(1, int(os.getenv("ATEC_TASKB_SIT_DOWN_STABLE_STEPS", "15")))
+        self.sit_down_roll_pitch_thresh = float(os.getenv("ATEC_TASKB_SIT_DOWN_RP_THRESH", "0.18"))
+        self.sit_down_height_vel_thresh = float(os.getenv("ATEC_TASKB_SIT_DOWN_ZVEL_THRESH", "0.15"))
+        self.sit_down_ang_vel_thresh = float(os.getenv("ATEC_TASKB_SIT_DOWN_ANGVEL_THRESH", "0.4"))
+        self._sit_down_step_count = 0
+        self._sit_down_stable_count = 0
 
         # 初始化日志系统
         self._log_file_path = self._init_logging()
@@ -206,6 +226,76 @@ class AlgSolution:
         os.makedirs(self.save_rgb_dir, exist_ok=True)
         self._rgb_save_warned = False
 
+        self._load_sit_down_actor_model()
+
+    def _load_sit_down_actor_model(self) -> None:
+        """加载 sit_down.pt 策略模型。"""
+        checkpoint_path = os.path.join(REPO_ROOT, "demo", "sit_down.pt")
+        if not os.path.exists(checkpoint_path):
+            self._log(f"[TaskB-SIT] sit-down checkpoint not found: {checkpoint_path}")
+            self.sit_down_actor = None
+            self.sit_down_actor_obs_dim = None
+            return
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+            state_dict = checkpoint["model_state_dict"]
+            actor_input_dim = state_dict["actor.0.weight"].shape[1]
+            actor_output_dim = state_dict["actor.6.bias"].shape[0]
+            self.sit_down_actor = B2PiperActor(actor_input_dim, actor_output_dim).to(self.device)
+            actor_state = {key: value for key, value in state_dict.items() if key.startswith("actor.")}
+            self.sit_down_actor.load_state_dict(actor_state, strict=True)
+            self.sit_down_actor.eval()
+            self.sit_down_actor_obs_dim = actor_input_dim
+            self._log(f"[TaskB-SIT] sit-down actor loaded: input={actor_input_dim}, output={actor_output_dim}")
+        except Exception as exc:
+            self._log(f"[TaskB-SIT] Failed to load sit-down actor model: {exc}")
+            self.sit_down_actor = None
+            self.sit_down_actor_obs_dim = None
+
+    def _generate_sit_down_action_tensor(self, obs) -> torch.Tensor:
+        zero_cmd = np.zeros(3, dtype=np.float32)
+        robot = self._get_robot()
+        if self.sit_down_actor is None:
+            # 无 sit-down actor 时，回退到 LegPostureController.step() 的 IK 方案
+            return self._generate_control_action_tensor(obs, zero_cmd, robot)
+        try:
+            policy_obs = self._extract_policy_obs(obs, zero_cmd, obs_dim=self.sit_down_actor_obs_dim)
+            with torch.inference_mode():
+                action_train = self.sit_down_actor(policy_obs)
+            if action_train.ndim == 1:
+                action_train = action_train.unsqueeze(0)
+            return self._map_policy_action_to_env_action(action_train)
+        except Exception as exc:
+            self._log(f"[TaskB-SIT] sit-down actor inference failed: {exc}")
+            return self._generate_control_action_tensor(obs, zero_cmd, robot)
+
+    def _reset_sit_down_tracking(self) -> None:
+        self._sit_down_step_count = 0
+        self._sit_down_stable_count = 0
+
+    def _is_sit_down_stable(self, robot) -> bool:
+        if robot is None or not hasattr(robot, "data"):
+            return False
+        try:
+            quat = robot.data.root_quat_w
+            w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+            sinr_cosp = 2.0 * (w * x + y * z)
+            cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+            roll = torch.atan2(sinr_cosp, cosr_cosp)
+            sinp = 2.0 * (w * y - z * x)
+            pitch = torch.asin(torch.clamp(sinp, -1.0, 1.0))
+            lin_vel_z = torch.abs(robot.data.root_lin_vel_b[:, 2])
+            ang_vel_xy = torch.linalg.norm(robot.data.root_ang_vel_b[:, :2], dim=1)
+            stable = (
+                (torch.abs(roll) <= self.sit_down_roll_pitch_thresh)
+                & (torch.abs(pitch) <= self.sit_down_roll_pitch_thresh)
+                & (lin_vel_z <= self.sit_down_height_vel_thresh)
+                & (ang_vel_xy <= self.sit_down_ang_vel_thresh)
+            )
+            return bool(torch.all(stable))
+        except Exception:
+            return False
+
     def _init_logging(self) -> str:
         log_dir = os.path.join(REPO_ROOT, "logs", "solution_rl")
         os.makedirs(log_dir, exist_ok=True)
@@ -242,6 +332,10 @@ class AlgSolution:
         self._locked_goal_target_id = None
         self._locked_target_world = None
         self._release_step_count = 0
+        self._pending_grasp_status = None
+        self._reset_sit_down_tracking()
+        if self._leg_posture_controller is not None:
+            self._leg_posture_controller.state = "IDLE"
         if self._arm_grasp_controller is not None:
             self._arm_grasp_controller.reset()
         if self.perception is not None and hasattr(self.perception, "reset"):
@@ -1633,7 +1727,7 @@ class AlgSolution:
             "stopped": np.allclose(base_cmd, 0.0),
         }
 
-    def _extract_policy_obs(self, obs: dict[str, Any], base_cmd: np.ndarray) -> torch.Tensor:
+    def _extract_policy_obs(self, obs: dict[str, Any], base_cmd: np.ndarray, obs_dim: int | None = None) -> torch.Tensor:
         proprio = torch.as_tensor(obs["proprio"], device=self.device, dtype=torch.float32)
         expected_dim = 3 + 3 + 3 + 3 + self.total_action_dim + self.total_action_dim + self.total_action_dim
         if proprio.shape[-1] != expected_dim:
@@ -1665,21 +1759,28 @@ class AlgSolution:
         actions_leg_env = actions_all[:, :self.leg_action_dim]
         actions_leg_train = actions_leg_env * self.leg_action_scale_inv.to(dtype=proprio.dtype)
 
-        velocity_commands = torch.as_tensor(base_cmd, device=self.device, dtype=proprio.dtype).view(1, 3)
-        if proprio.shape[0] > 1:
-            velocity_commands = velocity_commands.repeat(proprio.shape[0], 1)
+        # 默认 obs_dim 使用 walking policy (>= 45, 包含 velocity commands)；
+        # sit-down policy 使用较小值 (如 42)，不包含 velocity commands。
+        if obs_dim is None:
+            obs_dim = int(getattr(self.actor.actor[0], "in_features", 45)) if self.actor is not None else 45
 
-        policy_obs = torch.cat(
-            [
-                base_ang_vel * 0.25,
-                projected_gravity,
-                velocity_commands,
-                joint_pos_leg,
-                joint_vel_leg * 0.05,
-                actions_leg_train,
-            ],
-            dim=-1,
-        )
+        components = [
+            base_ang_vel * 0.25,
+            projected_gravity,
+        ]
+        # 仅在 walking policy 维度(>= 45) 时附加 velocity commands
+        if obs_dim >= 45:
+            velocity_commands = torch.as_tensor(base_cmd, device=self.device, dtype=proprio.dtype).view(1, 3)
+            if proprio.shape[0] > 1:
+                velocity_commands = velocity_commands.repeat(proprio.shape[0], 1)
+            components.append(velocity_commands)
+        components.extend([
+            joint_pos_leg,
+            joint_vel_leg * 0.05,
+            actions_leg_train,
+        ])
+
+        policy_obs = torch.cat(components, dim=-1)
         return torch.nan_to_num(policy_obs, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _map_policy_action_to_env_action(self, action_train: torch.Tensor) -> torch.Tensor:
@@ -2068,33 +2169,124 @@ class AlgSolution:
         
         return self._map_policy_action_to_env_action(action_train)
 
-    def _start_grasp_if_possible(self, target_grasp: dict[str, Any] | None) -> bool:
+    def _ensure_leg_joint_ids(self, robot) -> list[int] | None:
+        """延迟初始化 leg_joint_ids (与 ArmGraspController 中 arm_joint_ids 类似)。"""
+        if getattr(self, "_leg_joint_ids_cached", None) is not None:
+            return self._leg_joint_ids_cached
+        if robot is None:
+            return None
+        try:
+            leg_joint_ids, _ = robot.find_joints(list(self.leg_joint_names))
+            self._leg_joint_ids_cached = list(leg_joint_ids)
+            return self._leg_joint_ids_cached
+        except Exception as exc:
+            self._log(f"[TaskB-GRASP] leg joint ids not found: {exc}")
+            return None
+
+    def _generate_control_action_tensor(self, obs, base_cmd, robot) -> torch.Tensor:
+        """
+        生成环境动作张量。当 LegPostureController 不在 IDLE 时，使用其 IK 结果覆盖腿动作。
+        否则回退到 walking policy。
+        """
+        # 先生成默认动作（使用 walking policy）
+        action_env = self._policy_action_from_base_cmd(obs, base_cmd)
+
+        # 若 LegPostureController 不在 IDLE，则用其 IK 结果覆盖腿动作
+        if self._leg_posture_controller is not None and self._leg_posture_controller.state != "IDLE":
+            try:
+                _, target_dof_pos = self._leg_posture_controller.step(robot, self.dt)
+                if target_dof_pos is None:
+                    return action_env
+
+                leg_ids = self._ensure_leg_joint_ids(robot)
+                if leg_ids is None:
+                    return action_env
+
+                # 计算 leg action: (target_dof_pos - default_joint_pos) / action_scale
+                # 这与 ArmGraspController.apply_to_action_tensor 的风格一致
+                default_joint_pos = robot.data.default_joint_pos.to(
+                    device=action_env.device, dtype=action_env.dtype
+                )
+                current_joint_pos = robot.data.joint_pos.to(
+                    device=action_env.device, dtype=action_env.dtype
+                )
+                target_dof_pos = target_dof_pos.to(
+                    device=action_env.device, dtype=action_env.dtype
+                )
+                # 使用目标位置与当前位置的差作为动作 (与 solution_gt 保持一致)
+                num_envs = action_env.shape[0]
+                leg_target_expanded = torch.zeros_like(action_env)
+                # 将 target_dof_pos 映射到环境动作空间
+                for i, env_idx in enumerate(leg_ids):
+                    leg_target_expanded[:, env_idx] = target_dof_pos[:, i]
+                # 计算 scaled offset: (target - default) / scale —— 保持与 arm 一致的约定
+                leg_scaled = (
+                    target_dof_pos - default_joint_pos[:, : self.leg_action_dim]
+                ) / self.leg_action_scale.to(dtype=action_env.dtype)
+                action_env[:, : self.leg_action_dim] = leg_scaled
+                return torch.nan_to_num(action_env, nan=0.0, posinf=0.0, neginf=0.0)
+            except Exception as exc:
+                self._log(f"[TaskB-GRASP] leg posture control failed: {exc}")
+                return action_env
+
+        return action_env
+
+    def _start_crouch_then_grasp(self, target_grasp: dict[str, Any] | None) -> bool:
+        """到达目标后先蹲下，再开始抓取。"""
         if target_grasp is None:
+            return False
+        robot = self._get_robot()
+        if robot is None:
+            self._log("[TaskB-GRASP] robot unavailable, skip crouch start.")
             return False
         controller = self._ensure_arm_grasp_controller()
         if controller is None:
-            self._log("[TaskB-GRASP] controller unavailable, skip grasp start.")
+            self._log("[TaskB-GRASP] arm grasp controller unavailable, skip crouch start.")
             return False
-        grasp_pos_world = target_grasp.get("grasp_pos_world") or target_grasp.get("pos_world")
-        if grasp_pos_world is None:
-            self._log("[TaskB-GRASP] missing grasp_pos_world, skip grasp start.")
-            return False
-        current_ee_quat_w = controller.get_ee_pose()[1]
-        controller.start_grasp(target_grasp, grasp_pos_world, current_ee_quat_w=current_ee_quat_w)
-        grasp_quat_world = target_grasp.get("grasp_quat_world")
-        if grasp_quat_world is not None:
-            controller.target_ee_quat_w = np.asarray(grasp_quat_world, dtype=np.float32).copy()
+        # 启动 LegPostureController: 若 sit_down_actor 存在则仅用 IK 记录目标；
+        # 否则完全依赖 LegPostureController.step() 进行 IK 控制
+        if self._leg_posture_controller is not None:
+            try:
+                self._leg_posture_controller.start_crouch(robot)
+            except Exception as exc:
+                self._log(f"[TaskB-GRASP] leg posture controller start_crouch failed: {exc}")
+        else:
+            self._log("[TaskB-GRASP] LegPostureController unavailable, will rely on sit_down_actor only.")
+        self._reset_sit_down_tracking()
         self._pending_grasp_target = dict(target_grasp)
-        self._task_state = "GRASP_OBJECT"
+        self._task_state = "CROUCHING"
         self._log(
-            "[TaskB-GRASP] start "
+            "[TaskB-GRASP] start crouch "
             f"id={target_grasp.get('id')} class={target_grasp.get('class')} "
-            f"grasp_pos_world={np.asarray(grasp_pos_world, dtype=np.float32).round(3).tolist()}"
+            f"grasp_pos_world={np.asarray(target_grasp.get('grasp_pos_world') or target_grasp.get('pos_world'), dtype=np.float32).round(3).tolist()}"
         )
         return True
 
+    def _finish_stand_up_and_return_to_navigation(self, success: bool) -> None:
+        """站立完成：根据抓取成功与否切换到导航或重新接近。"""
+        if success and self._pending_grasp_target is not None:
+            self._task_state = "NAV_TO_BIN"
+            self._log("[TaskB-GRASP] stand up complete with success, switching to NAV_TO_BIN")
+        else:
+            self._task_state = "APPROACH_OBJECT"
+            self._pending_grasp_target = None
+            self._clear_locked_target()
+            self._log("[TaskB-GRASP] stand up complete without success, return to APPROACH_OBJECT")
+
     def predicts(self, obs, current_score):
         del current_score
+        try:
+            return self._predicts_impl(obs)
+        except Exception as exc:
+            self._log(f"[TaskB-FATAL] predicts failed: {type(exc).__name__} {exc}")
+            try:
+                safe_action = self._policy_action_from_base_cmd(obs, np.zeros(3, dtype=np.float32))
+                return {"action": safe_action.cpu().numpy().tolist(), "giveup": False}
+            except Exception as exc2:
+                self._log(f"[TaskB-FATAL] fallback policy also failed: {type(exc2).__name__} {exc2}")
+                return {"action": [[0.0] * self.total_action_dim], "giveup": False}
+
+    def _predicts_impl(self, obs):
         self._step_count += 1
         local_nav = self._update_local_odometry(obs)
         perception_output, robot_pos_world, robot_yaw, pose_source = self._get_perception_output(obs, local_nav)
@@ -2131,11 +2323,97 @@ class AlgSolution:
                 _, nav_info = self._compute_nav_cmd_from_target_nav(target_nav)
                 nav_info["phase"] = "stand"
                 nav_info["stopped"] = True
-        elif self._task_state == "GRASP_OBJECT":
+        elif self._task_state == "CROUCHING":
+            robot = self._get_robot()
+            controller = self._ensure_arm_grasp_controller()
+            action_env = self._generate_sit_down_action_tensor(obs)
+            nav_info = self._make_pipeline_nav_info(
+                perception_output,
+                pose_source,
+                self._pending_grasp_target,
+                phase="crouching",
+                stopped=True,
+            )
+            if robot is None:
+                self._log("[TaskB-GRASP] robot missing during crouch, return to approach.")
+                self._task_state = "APPROACH_OBJECT"
+                self._pending_grasp_target = None
+                self._clear_frozen_pregrasp()
+            else:
+                self._sit_down_step_count += 1
+                crouch_ready = False
+                if self.sit_down_actor is not None:
+                    # 策略驱动：基于姿态稳定判定
+                    if self._is_sit_down_stable(robot):
+                        self._sit_down_stable_count += 1
+                    else:
+                        self._sit_down_stable_count = 0
+                    crouch_ready = (
+                        self._sit_down_step_count >= self.sit_down_min_steps
+                        and self._sit_down_stable_count >= self.sit_down_stable_steps_required
+                    )
+                    if crouch_ready:
+                        try:
+                            self._leg_posture_controller.state = "HOLDING_CROUCH"
+                        except Exception:
+                            pass
+                else:
+                    # IK 驱动：当 LegPostureController 到达 HOLDING_CROUCH 即视为就绪
+                    if self._leg_posture_controller is not None:
+                        crouch_ready = self._leg_posture_controller.state == "HOLDING_CROUCH"
+
+                # 超时保护：避免永久卡住
+                max_crouch_steps = max(1, int(os.getenv("ATEC_TASKB_MAX_CROUCH_STEPS", "400")))
+                if self._sit_down_step_count >= max_crouch_steps and not crouch_ready:
+                    self._log(f"[TaskB-GRASP] crouch timeout after {self._sit_down_step_count} steps, giving up.")
+                    self._pending_grasp_status = "failed"
+                    try:
+                        self._leg_posture_controller.start_stand_up(robot)
+                    except Exception:
+                        pass
+                    self._reset_sit_down_tracking()
+                    self._task_state = "STAND_UP"
+                    crouch_ready = False
+
+                if crouch_ready:
+                    if self._pending_grasp_target is not None and controller is not None:
+                        grasp_pos_world = self._pending_grasp_target.get("grasp_pos_world") or self._pending_grasp_target.get("pos_world")
+                        try:
+                            current_ee_quat_w = controller.get_ee_pose()[1]
+                            controller.start_grasp(
+                                self._pending_grasp_target,
+                                grasp_pos_world,
+                                current_ee_quat_w=current_ee_quat_w,
+                            )
+                            self._task_state = "GRASPING"
+                            self._log(
+                                "[TaskB-GRASP] crouch complete, started arm grasp "
+                                f"id={self._pending_grasp_target.get('id')} "
+                                f"class={self._pending_grasp_target.get('class')}"
+                            )
+                        except Exception as exc:
+                            self._log(f"[TaskB-GRASP] start_grasp failed: {exc}, standing up.")
+                            self._pending_grasp_status = "failed"
+                            try:
+                                self._leg_posture_controller.start_stand_up(robot)
+                            except Exception:
+                                pass
+                            self._reset_sit_down_tracking()
+                            self._task_state = "STAND_UP"
+                    elif controller is None:
+                        self._pending_grasp_status = "failed"
+                        try:
+                            self._leg_posture_controller.start_stand_up(robot)
+                        except Exception:
+                            pass
+                        self._reset_sit_down_tracking()
+                        self._task_state = "STAND_UP"
+                        self._log("[TaskB-GRASP] arm grasp controller unavailable after crouch, standing up.")
+        elif self._task_state == "GRASPING":
             robot = self._get_robot()
             scene = self._get_scene()
             controller = self._ensure_arm_grasp_controller()
-            action_env = self._policy_action_from_base_cmd(obs, np.zeros(3, dtype=np.float32))
+            action_env = self._generate_sit_down_action_tensor(obs)
             nav_info = self._make_pipeline_nav_info(
                 perception_output,
                 pose_source,
@@ -2144,22 +2422,76 @@ class AlgSolution:
                 stopped=True,
             )
             if controller is None or robot is None:
-                self._log("[TaskB-GRASP] robot/controller unavailable during grasp, fallback to approach.")
-                self._task_state = "APPROACH_OBJECT"
-                self._pending_grasp_target = None
-                self._clear_frozen_pregrasp()
+                self._log("[TaskB-GRASP] robot/controller unavailable during grasp, standing up.")
+                if robot is not None:
+                    try:
+                        self._leg_posture_controller.start_stand_up(robot)
+                    except Exception:
+                        pass
+                    self._pending_grasp_status = "failed"
+                    self._reset_sit_down_tracking()
+                    self._task_state = "STAND_UP"
+                else:
+                    self._task_state = "APPROACH_OBJECT"
+                    self._pending_grasp_target = None
             else:
                 done, success = controller.step(robot, scene, self.dt)
                 action_env = controller.apply_to_action_tensor(action_env, robot)
                 if done:
-                    if success:
-                        self._task_state = "NAV_TO_BIN"
-                        self._log("[TaskB-GRASP] success, switching to NAV_TO_BIN")
+                    self._pending_grasp_status = "grasped" if success else "failed"
+                    try:
+                        self._leg_posture_controller.start_stand_up(robot)
+                    except Exception:
+                        pass
+                    self._reset_sit_down_tracking()
+                    self._task_state = "STAND_UP"
+                    self._log(
+                        f"[TaskB-GRASP] arm grasp finished, success={success}. Starting stand up."
+                    )
+        elif self._task_state == "STAND_UP":
+            robot = self._get_robot()
+            action_env = self._generate_sit_down_action_tensor(obs)
+            nav_info = self._make_pipeline_nav_info(
+                perception_output,
+                pose_source,
+                self._pending_grasp_target,
+                phase="standing_up",
+                stopped=True,
+            )
+            if robot is None:
+                self._log("[TaskB-GRASP] robot missing during stand up, return to approach.")
+                self._finish_stand_up_and_return_to_navigation(False)
+            else:
+                self._sit_down_step_count += 1
+                stand_up_done = False
+                if self.sit_down_actor is not None:
+                    if self._is_sit_down_stable(robot):
+                        self._sit_down_stable_count += 1
                     else:
-                        self._task_state = "APPROACH_OBJECT"
-                        self._log("[TaskB-GRASP] failed, switching back to APPROACH_OBJECT")
-                        self._pending_grasp_target = None
-                        self._clear_locked_target()
+                        self._sit_down_stable_count = 0
+                    stand_up_done = (
+                        self._sit_down_step_count >= self.sit_down_min_steps
+                        and self._sit_down_stable_count >= self.sit_down_stable_steps_required
+                    )
+                else:
+                    # IK 驱动：当 LegPostureController 回到 IDLE 视为站立完成
+                    if self._leg_posture_controller is not None:
+                        stand_up_done = self._leg_posture_controller.state == "IDLE"
+
+                # 超时保护
+                max_stand_steps = max(1, int(os.getenv("ATEC_TASKB_MAX_STAND_STEPS", "400")))
+                if self._sit_down_step_count >= max_stand_steps and not stand_up_done:
+                    self._log(f"[TaskB-GRASP] stand up timeout after {self._sit_down_step_count} steps, forcing done.")
+                    stand_up_done = True
+
+                if stand_up_done:
+                    self._reset_sit_down_tracking()
+                    try:
+                        self._leg_posture_controller.state = "IDLE"
+                    except Exception:
+                        pass
+                    grasp_success = self._pending_grasp_status == "grasped"
+                    self._finish_stand_up_and_return_to_navigation(grasp_success)
         elif self._task_state == "NAV_TO_BIN":
             bin_nav_input = {
                 "robot": {"pos_world": robot_pos_world.tolist(), "yaw": float(robot_yaw)},
@@ -2239,7 +2571,31 @@ class AlgSolution:
                     base_cmd = np.zeros(3, dtype=np.float32)
                     nav_info["phase"] = "start_grasp"
                     nav_info["stopped"] = True
-                    self._start_grasp_if_possible(matched_grasp_target)
+                    # 改为先蹲下再抓取，与 solution_gt 对齐
+                    started = self._start_crouch_then_grasp(matched_grasp_target)
+                    if not started:
+                        # 如果无法启动蹲下流程，回退到直接抓取逻辑
+                        self._log("[TaskB-GRASP] crouch start failed, fall back to direct grasp (if available).")
+                        # 尝试直接启动抓取控制器；若都不可用则保持 approach
+                        ctrl = self._ensure_arm_grasp_controller()
+                        if ctrl is not None:
+                            try:
+                                grasp_pos_world = matched_grasp_target.get("grasp_pos_world") or matched_grasp_target.get("pos_world")
+                                current_ee_quat_w = ctrl.get_ee_pose()[1]
+                                ctrl.start_grasp(matched_grasp_target, grasp_pos_world, current_ee_quat_w=current_ee_quat_w)
+                                self._pending_grasp_target = dict(matched_grasp_target)
+                                # 无 sit-down actor 时直接进入 GRASPING 阶段
+                                self._task_state = "GRASPING"
+                                self._log("[TaskB-GRASP] direct grasp started (no sit-down).")
+                            except Exception as exc:
+                                self._log(f"[TaskB-GRASP] direct grasp also failed: {exc}")
+                                self._task_state = "APPROACH_OBJECT"
+                                self._pending_grasp_target = None
+                                self._clear_locked_target()
+                        else:
+                            self._task_state = "APPROACH_OBJECT"
+                            self._pending_grasp_target = None
+                            self._clear_locked_target()
             else:
                 base_cmd = np.array([0.0, 0.0, self.search_yaw_rate], dtype=np.float32)
                 search_phase = "searching_lost_target" if self._tracked_target is not None else "search"
