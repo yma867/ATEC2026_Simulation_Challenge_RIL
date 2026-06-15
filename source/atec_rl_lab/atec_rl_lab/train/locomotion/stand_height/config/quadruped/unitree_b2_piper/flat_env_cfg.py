@@ -13,8 +13,8 @@ CROUCH_JOINT_POS = {
     ".*R_hip_joint": -0.3,
     ".*L_hip_joint": 0.3,
     "F[L,R]_thigh_joint": 0.6,
-    "R[L,R]_thigh_joint": 1.0,
-    ".*_calf_joint": -2.0,
+    "R[L,R]_thigh_joint": 0.8,
+    ".*_calf_joint": -2.3,
 }
 
 
@@ -94,7 +94,11 @@ class UnitreeB2PiperStandHeightFlatEnvCfg(UnitreeB2PiperFlatEnvCfg):
 
         # Reinstate the contact/stability terms that discourage body collapse.
         self.rewards.undesired_contacts.weight = -1.0
-        self.rewards.undesired_contacts.params["sensor_cfg"].body_names = [f"^(?!.*{self.foot_link_name}).*"]
+        # Allow both foot and calf contacts (calf contact helps stability)
+        # Use single regex to exclude both foot and calf patterns
+        self.rewards.undesired_contacts.params["sensor_cfg"].body_names = [
+            f"^(?!.*({self.foot_link_name}|_calf)).*",
+        ]
         self.rewards.contact_forces.weight = -1.5e-4
         self.rewards.contact_forces.params["sensor_cfg"].body_names = [self.foot_link_name]
 

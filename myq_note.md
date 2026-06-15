@@ -19,3 +19,6 @@ ATEC2026_Simulation_Challenge_RIL/logs/rsl_rl/unitree_b2_piper_stand_height_flat
 
 # 臂的初始位置不对
 环境的动作空间是相对默认位置的偏移量
+
+# 修改臂初始位置在
+task_b/env_cfg.py
