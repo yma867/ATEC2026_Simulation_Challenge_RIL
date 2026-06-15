@@ -110,6 +110,7 @@ class UnitreeB2PiperRoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.joint_vel_limits.weight = 0
         self.rewards.joint_power.weight = -1e-5
         self.rewards.stand_still.weight = -2.0
+        self.rewards.stand_still.params["command_threshold"] = 0.1
         self.rewards.joint_pos_penalty.weight = -1.0
         self.rewards.joint_mirror.weight = -0.05
         self.rewards.joint_mirror.params["mirror_joints"] = [

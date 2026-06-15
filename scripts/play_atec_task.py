@@ -41,6 +41,12 @@ parser.add_argument(
     default=False,
     help="Enable WBC mode (use WBC to control the robot).",
 )
+parser.add_argument(
+    "--show_score",
+    action="store_true",
+    default=False,
+    help="Show real-time score and elapsed time during play.",
+)
 
 # Isaac Sim / Kit args
 AppLauncher.add_app_launcher_args(parser)
@@ -139,6 +145,7 @@ def play() -> tuple[float, float]:
     # -------------------------------------------------------------------------
     total_episode_reward = 0.0
     total_elapsed_time = 0.0
+    last_reward = 0.0  # Track last reward for delta display
     while simulation_app.is_running():
         with torch.inference_mode():
             start_time = time.time()
@@ -172,6 +179,13 @@ def play() -> tuple[float, float]:
             if args_cli.debug:
                 print(f"total_episode_reward:{total_episode_reward: .2f}")
                 print(f"total_elapsed_time:{total_elapsed_time: .2f}")
+            
+            # Show score only when reward increases
+            if args_cli.show_score:
+                reward_delta = total_episode_reward - last_reward
+                if reward_delta > 0.001:  # Only show when there's a meaningful increase
+                    print(f"[+{reward_delta:.2f}] Score: {total_episode_reward:.2f} | Time: {total_elapsed_time:.2f}s")
+                last_reward = total_episode_reward
 
             done = (terminated.item() or truncated.item())
             if done:

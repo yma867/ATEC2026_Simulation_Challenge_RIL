@@ -620,27 +620,16 @@ class PolicyNavigator:
             else:
                 vx_w = self.kp_pos * error_xy_w[0]
                 vy_w = self.kp_pos * error_xy_w[1]
-                
-                # 计算当前速度（减速前）
-                vx_body_raw, vy_body_raw = self._world_to_body_velocity(vx_w, vy_w, robot_yaw)
-                speed_raw = np.sqrt(vx_body_raw**2 + vy_body_raw**2)
-                
-                # 减速逻辑：确保减速后速度不低于训练时的最小阈值 0.2
-                MIN_TRAIN_VELOCITY = 0.2
                 if pos_error_norm < self.slow_radius:
                     decel_ratio = pos_error_norm / self.slow_radius
-                    # 确保减速后速度不低于 MIN_TRAIN_VELOCITY
-                    if speed_raw * decel_ratio < MIN_TRAIN_VELOCITY and speed_raw > MIN_TRAIN_VELOCITY:
-                        decel_ratio = MIN_TRAIN_VELOCITY / speed_raw
                     vx_w *= decel_ratio
                     vy_w *= decel_ratio
-                
                 vx_body, vy_body = self._world_to_body_velocity(vx_w, vy_w, robot_yaw)
                 vx_body = max(-self.max_vx, min(self.max_vx, vx_body))
                 vy_body = max(-self.max_vy, min(self.max_vy, vy_body))
                 
-                # 添加最小速度阈值，避免过小的速度命令（训练时屏蔽了<0.2的命令）
-                MIN_VELOCITY = MIN_TRAIN_VELOCITY
+                # 添加最小速度阈值，避免过小的速度命令
+                MIN_VELOCITY = 0.25
                 if abs(vx_body) < MIN_VELOCITY and abs(vy_body) < MIN_VELOCITY:
                     vx_body = 0.0
                     vy_body = 0.0
@@ -772,7 +761,7 @@ class ArmGraspController:
         gripper_joint_names: list[str],
         ee_body_name: str = "gripper_base",
         action_scale: float = 0.5,
-        pregrasp_height: float = 0.15,
+        pregrasp_height: float = 0.20,
         grasp_height_offset: float = 0.03,
         lift_height: float = 0.30,
         ee_pos_tol: float = 0.05,
@@ -797,9 +786,6 @@ class ArmGraspController:
         self.gripper_open_pos = torch.tensor(gripper_open_pos, dtype=torch.float32, device=device)
         self.gripper_close_pos = torch.tensor(gripper_close_pos, dtype=torch.float32, device=device)
         self.log_every_steps = max(1, int(log_every_steps))
-        
-        # 时间步长，用于笛卡尔空间速度限制
-        self.dt = float(os.getenv("ATEC_TASKB_SIM_DT", "0.02"))
 
         self.arm_joint_ids, _ = robot.find_joints(self.arm_joint_names)
         self.gripper_joint_ids, _ = robot.find_joints(self.gripper_joint_names)
@@ -810,8 +796,6 @@ class ArmGraspController:
             print("[ArmGraspController] Warning: CartesianController unavailable, grasping will fail closed.", flush=True)
         else:
             try:
-                # max_joint_delta controls arm movement speed - smaller = slower/more stable
-                max_joint_delta = float(os.getenv("ATEC_TASKB_ARM_MAX_JOINT_DELTA", "0.005"))
                 self.cartesian = CartesianController(
                     robot=robot,
                     ee_body_name=ee_body_name,
@@ -820,7 +804,7 @@ class ArmGraspController:
                     device=str(device),
                     command_type="position",
                     lambda_val=0.1,
-                    max_joint_delta=max_joint_delta,
+                    max_joint_delta=0.2,
                 )
                 self.cartesian.reset()
             except Exception as exc:
@@ -928,28 +912,7 @@ class ArmGraspController:
     def move_ee_to_pose(self, target_pos_w, target_quat_w=None):
         if self.cartesian is None:
             return
-        
-        # 获取当前末端执行器位置
-        current_ee_pos, _ = self.get_ee_pose()
-        
-        # 计算目标位置与当前位置的差
-        delta_pos = np.array(target_pos_w) - current_ee_pos
-        
-        # 限制笛卡尔空间速度（单位：米/秒）
-        MAX_CARTESIAN_VELOCITY = float(os.getenv("ATEC_TASKB_ARM_MAX_CARTESIAN_VEL", "0.05"))
-        delta_norm = np.linalg.norm(delta_pos)
-        
-        # 计算单步最大移动距离
-        max_step = MAX_CARTESIAN_VELOCITY * self.dt if hasattr(self, 'dt') else MAX_CARTESIAN_VELOCITY * 0.02
-        
-        # 如果距离超过单步最大移动距离，进行限制
-        if delta_norm > max_step:
-            delta_pos = delta_pos / delta_norm * max_step
-        
-        # 计算受限后的目标位置
-        limited_target_pos = current_ee_pos + delta_pos
-        
-        target_pos = torch.as_tensor(limited_target_pos, dtype=torch.float32, device=self.device).view(1, 3)
+        target_pos = torch.as_tensor(target_pos_w, dtype=torch.float32, device=self.device).view(1, 3)
         if self.cartesian.command_type == "position":
             self.desired_arm_joint_pos = self.cartesian.compute(target_pos).detach().clone()
         else:
@@ -1548,24 +1511,24 @@ class LegPostureController:
         trk_str = None if trk is None else trk.detach().cpu().tolist()
         tgt = debug_info.get("max_abs_target_error")
         tgt_str = None if tgt is None else tgt.detach().cpu().tolist()
-        # print(
-        #     f"[SQUAT-CTRL] state={debug_info['state']} "
-        #     f"alpha={alpha_str} "
-        #     f"current_height={debug_info['current_height'].detach().cpu().tolist()} "
-        #     f"desired_root_height={debug_info['desired_root_height'].detach().cpu().tolist()} "
-        #     f"goal_height={debug_info['goal_height'].detach().cpu().tolist()} "
-        #     f"height_error={debug_info['height_error'].detach().cpu().tolist()} "
-        #     f"roll={debug_info['roll'].detach().cpu().tolist()} "
-        #     f"pitch={debug_info['pitch'].detach().cpu().tolist()} "
-        #     f"max_foot_error={debug_info['max_foot_error'].detach().cpu().tolist()} "
-        #     f"max_abs_leg_delta_pre_clamp={None if self._last_leg_delta_pre_clamp is None else self._last_leg_delta_pre_clamp.detach().cpu().tolist()} "
-        #     f"max_abs_leg_delta_post_clamp={None if self._last_leg_delta_post_clamp is None else self._last_leg_delta_post_clamp.detach().cpu().tolist()} "
-        #     f"unstable={debug_info['unstable'].detach().cpu().tolist()} "
-        #     f"paused={debug_info['paused'].detach().cpu().tolist()} "
-        #     f"max_abs_tracking_error={trk_str} "
-        #     f"max_abs_target_error={tgt_str}",
-        #     flush=True,
-        # )
+        print(
+            f"[SQUAT-CTRL] state={debug_info['state']} "
+            f"alpha={alpha_str} "
+            f"current_height={debug_info['current_height'].detach().cpu().tolist()} "
+            f"desired_root_height={debug_info['desired_root_height'].detach().cpu().tolist()} "
+            f"goal_height={debug_info['goal_height'].detach().cpu().tolist()} "
+            f"height_error={debug_info['height_error'].detach().cpu().tolist()} "
+            f"roll={debug_info['roll'].detach().cpu().tolist()} "
+            f"pitch={debug_info['pitch'].detach().cpu().tolist()} "
+            f"max_foot_error={debug_info['max_foot_error'].detach().cpu().tolist()} "
+            f"max_abs_leg_delta_pre_clamp={None if self._last_leg_delta_pre_clamp is None else self._last_leg_delta_pre_clamp.detach().cpu().tolist()} "
+            f"max_abs_leg_delta_post_clamp={None if self._last_leg_delta_post_clamp is None else self._last_leg_delta_post_clamp.detach().cpu().tolist()} "
+            f"unstable={debug_info['unstable'].detach().cpu().tolist()} "
+            f"paused={debug_info['paused'].detach().cpu().tolist()} "
+            f"max_abs_tracking_error={trk_str} "
+            f"max_abs_target_error={tgt_str}",
+            flush=True,
+        )
 
     def _solve_leg_targets_for_height(
         self,
@@ -1766,13 +1729,6 @@ class AlgSolution:
         self._wbc_grasp_success = False
         self._wbc_grasp_timeout = 500
         self._wbc_last_action_18 = None
-        self.sit_down_min_steps = max(1, int(os.getenv("ATEC_TASKB_SIT_DOWN_MIN_STEPS", "30")))
-        self.sit_down_stable_steps_required = max(1, int(os.getenv("ATEC_TASKB_SIT_DOWN_STABLE_STEPS", "15")))
-        self.sit_down_roll_pitch_thresh = float(os.getenv("ATEC_TASKB_SIT_DOWN_RP_THRESH", "0.18"))
-        self.sit_down_height_vel_thresh = float(os.getenv("ATEC_TASKB_SIT_DOWN_ZVEL_THRESH", "0.15"))
-        self.sit_down_ang_vel_thresh = float(os.getenv("ATEC_TASKB_SIT_DOWN_ANGVEL_THRESH", "0.4"))
-        self._sit_down_step_count = 0
-        self._sit_down_stable_count = 0
         
         # 加载预训练模型（用于腿部控制）
         self._load_actor_model()
@@ -1875,37 +1831,7 @@ class AlgSolution:
             print(f"[GT-NAV] Failed to load actor model: {e}")
             self.actor = None
 
-        self._load_sit_down_actor_model()
         self._load_wbc_actor_model()
-
-    def _load_sit_down_actor_model(self):
-        """加载下蹲策略模型。"""
-        self.sit_down_checkpoint_path = os.path.join(REPO_ROOT, "demo", "sit_down.pt")
-        self.sit_down_actor = None
-        self.sit_down_actor_obs_dim = None
-
-        if not os.path.exists(self.sit_down_checkpoint_path):
-            print(f"[GT-NAV] Warning: sit-down checkpoint not found: {self.sit_down_checkpoint_path}")
-            return
-
-        try:
-            checkpoint = torch.load(self.sit_down_checkpoint_path, map_location="cpu")
-            state_dict = checkpoint["model_state_dict"]
-            actor_input_dim = state_dict["actor.0.weight"].shape[1]
-            actor_output_dim = state_dict["actor.6.bias"].shape[0]
-            self.sit_down_actor = B2PiperActor(actor_input_dim, actor_output_dim).to(self.device)
-            actor_state = {key: value for key, value in state_dict.items() if key.startswith("actor.")}
-            self.sit_down_actor.load_state_dict(actor_state, strict=True)
-            self.sit_down_actor.eval()
-            self.sit_down_actor_obs_dim = actor_input_dim
-            print(
-                f"[GT-NAV] Sit-down actor loaded: input={actor_input_dim}, output={actor_output_dim}",
-                flush=True,
-            )
-        except Exception as e:
-            print(f"[GT-NAV] Failed to load sit-down actor model: {e}", flush=True)
-            self.sit_down_actor = None
-            self.sit_down_actor_obs_dim = None
 
     def _load_wbc_actor_model(self):
         """加载 WBC 全身控制模型"""
@@ -2200,12 +2126,11 @@ class AlgSolution:
         self._leg_control_initialized = True
 
         if not self._printed_leg_control_info:
-            # Comment out IK squat debug prints for cleaner output (using sit_down.pt)
-            # print(f"[SQUAT] dof_names={self._leg_joint_names_in_robot}", flush=True)
-            # squat_dof_pos = self._leg_posture_controller.get_squat_dof_pos()
-            # if squat_dof_pos is not None:
-            #     print(f"[SQUAT] squat_dof_pos={squat_dof_pos[0].detach().cpu().tolist()}", flush=True)
-            # print(f"[SQUAT] env_leg_order={self.leg_joint_names}", flush=True)
+            print(f"[SQUAT] dof_names={self._leg_joint_names_in_robot}", flush=True)
+            squat_dof_pos = self._leg_posture_controller.get_squat_dof_pos()
+            if squat_dof_pos is not None:
+                print(f"[SQUAT] squat_dof_pos={squat_dof_pos[0].detach().cpu().tolist()}", flush=True)
+            print(f"[SQUAT] env_leg_order={self.leg_joint_names}", flush=True)
             self._printed_leg_control_info = True
 
     def _reorder_env_leg_to_robot(self, tensor_env_order: torch.Tensor) -> torch.Tensor:
@@ -2277,19 +2202,19 @@ class AlgSolution:
         torques = self._leg_p_gains * (target_dof_pos - dof_pos) - self._leg_d_gains * dof_vel
         torques = torch.clip(torques, -self._leg_torque_limits, self._leg_torque_limits)
 
-        # if self._step_count % self.control_cfg.debug_interval == 0:
-        #     alpha = self._leg_posture_controller.get_alpha()
-        #     roll, pitch, height = self._get_base_rpy_height(robot)
-        #     print(
-        #         f"[SQUAT] alpha={None if alpha is None else alpha.detach().cpu().tolist()} "
-        #         f"target_dof_pos={target_dof_pos[0].detach().cpu().tolist()} "
-        #         f"dof_pos={dof_pos[0].detach().cpu().tolist()} "
-        #         f"torque_max={float(torch.max(torch.abs(torques)).item()):.3f} "
-        #         f"roll={float(roll[0].item()):.3f} "
-        #         f"pitch={float(pitch[0].item()):.3f} "
-        #         f"height={float(height[0].item()):.3f}",
-        #         flush=True,
-        #     )
+        if self._step_count % self.control_cfg.debug_interval == 0:
+            alpha = self._leg_posture_controller.get_alpha()
+            roll, pitch, height = self._get_base_rpy_height(robot)
+            print(
+                f"[SQUAT] alpha={None if alpha is None else alpha.detach().cpu().tolist()} "
+                f"target_dof_pos={target_dof_pos[0].detach().cpu().tolist()} "
+                f"dof_pos={dof_pos[0].detach().cpu().tolist()} "
+                f"torque_max={float(torch.max(torch.abs(torques)).item()):.3f} "
+                f"roll={float(roll[0].item()):.3f} "
+                f"pitch={float(pitch[0].item()):.3f} "
+                f"height={float(height[0].item()):.3f}",
+                flush=True,
+            )
         return torques
 
     def _compute_leg_position_actions(self, target_dof_pos: torch.Tensor, robot) -> torch.Tensor:
@@ -2311,18 +2236,18 @@ class AlgSolution:
             self._last_leg_action_override = leg_actions.clone()
 
         dof_pos = current_dof_pos
-        # if self._step_count % self.control_cfg.debug_interval == 0:
-        #     alpha = self._leg_posture_controller.get_alpha()
-        #     roll, pitch, height = self._get_base_rpy_height(robot)
-        #     print(
-        #         f"[SQUAT] alpha={None if alpha is None else alpha.detach().cpu().tolist()} "
-        #         f"target_dof_pos={target_dof_pos[0].detach().cpu().tolist()} "
-        #         f"dof_pos={dof_pos[0].detach().cpu().tolist()} "
-        #         f"roll={float(roll[0].item()):.3f} "
-        #         f"pitch={float(pitch[0].item()):.3f} "
-        #         f"height={float(height[0].item()):.3f}",
-        #         flush=True,
-        #     )
+        if self._step_count % self.control_cfg.debug_interval == 0:
+            alpha = self._leg_posture_controller.get_alpha()
+            roll, pitch, height = self._get_base_rpy_height(robot)
+            print(
+                f"[SQUAT] alpha={None if alpha is None else alpha.detach().cpu().tolist()} "
+                f"target_dof_pos={target_dof_pos[0].detach().cpu().tolist()} "
+                f"dof_pos={dof_pos[0].detach().cpu().tolist()} "
+                f"roll={float(roll[0].item()):.3f} "
+                f"pitch={float(pitch[0].item()):.3f} "
+                f"height={float(height[0].item()):.3f}",
+                flush=True,
+            )
         return leg_actions
 
     def _generate_control_action_tensor(self, obs, base_cmd, robot) -> torch.Tensor:
@@ -2747,8 +2672,8 @@ class AlgSolution:
             "target_class": target["class"]
         }
 
-    def _extract_policy_obs(self, obs: dict[str, Any], base_cmd: np.ndarray, obs_dim: int | None = None) -> torch.Tensor:
-        """提取策略观测，兼容 walking policy(45) 和 sit-down policy(42)。"""
+    def _extract_policy_obs(self, obs: dict[str, Any], base_cmd: np.ndarray) -> torch.Tensor:
+        """提取策略观测（与 solution_rl.py 兼容）"""
         proprio = torch.as_tensor(obs["proprio"], device=self.device, dtype=torch.float32)
         
         idx = 0
@@ -2777,25 +2702,21 @@ class AlgSolution:
         actions_leg_env = actions_all[:, :self.leg_action_dim]
         actions_leg_train = actions_leg_env * self.leg_action_scale_inv.to(dtype=proprio.dtype)
         
-        if obs_dim is None:
-            obs_dim = int(getattr(self.actor.actor[0], "in_features", 45)) if self.actor is not None else 45
-
-        components = [
-            base_ang_vel * 0.25,
-            projected_gravity,
-        ]
-        if obs_dim >= 45:
-            velocity_commands = torch.as_tensor(base_cmd, device=self.device, dtype=proprio.dtype).view(1, 3)
-            if proprio.shape[0] > 1:
-                velocity_commands = velocity_commands.repeat(proprio.shape[0], 1)
-            components.append(velocity_commands)
-        components.extend([
-            joint_pos_leg,
-            joint_vel_leg * 0.05,
-            actions_leg_train,
-        ])
-
-        policy_obs = torch.cat(components, dim=-1)
+        velocity_commands = torch.as_tensor(base_cmd, device=self.device, dtype=proprio.dtype).view(1, 3)
+        if proprio.shape[0] > 1:
+            velocity_commands = velocity_commands.repeat(proprio.shape[0], 1)
+        
+        policy_obs = torch.cat(
+            [
+                base_ang_vel * 0.25,
+                projected_gravity,
+                velocity_commands,
+                joint_pos_leg,
+                joint_vel_leg * 0.05,
+                actions_leg_train,
+            ],
+            dim=-1,
+        )
         return torch.nan_to_num(policy_obs, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _map_policy_action_to_env_action(self, action_train: torch.Tensor) -> torch.Tensor:
@@ -2809,17 +2730,15 @@ class AlgSolution:
         action_env[:, self.leg_action_dim:] = 0.0
         return torch.nan_to_num(action_env, nan=0.0, posinf=0.0, neginf=0.0)
 
-    def _generate_action_tensor(self, obs, base_cmd, actor=None, obs_dim: int | None = None) -> torch.Tensor:
+    def _generate_action_tensor(self, obs, base_cmd) -> torch.Tensor:
         """生成环境动作张量，便于叠加机械臂抓取目标。"""
-        if actor is None:
-            actor = self.actor
-        if obs is None or actor is None:
+        if obs is None or self.actor is None:
             return torch.zeros((1, self.total_action_dim), device=self.device, dtype=torch.float32)
 
         try:
-            policy_obs = self._extract_policy_obs(obs, base_cmd, obs_dim=obs_dim)
+            policy_obs = self._extract_policy_obs(obs, base_cmd)
             with torch.inference_mode():
-                action_train = actor(policy_obs)
+                action_train = self.actor(policy_obs)
 
             if action_train.ndim == 1:
                 action_train = action_train.unsqueeze(0)
@@ -2828,31 +2747,6 @@ class AlgSolution:
         except Exception as e:
             print(f"[GT-NAV] Actor inference error: {e}", flush=True)
             return torch.zeros((1, self.total_action_dim), device=self.device, dtype=torch.float32)
-
-    def _generate_sit_down_action_tensor(self, obs) -> torch.Tensor:
-        zero_cmd = np.zeros(3, dtype=np.float32)
-        return self._generate_action_tensor(
-            obs,
-            zero_cmd,
-            actor=self.sit_down_actor,
-            obs_dim=self.sit_down_actor_obs_dim,
-        )
-
-    def _reset_sit_down_tracking(self):
-        self._sit_down_step_count = 0
-        self._sit_down_stable_count = 0
-
-    def _is_sit_down_stable(self, robot) -> bool:
-        roll, pitch, _ = self._get_base_rpy_height(robot)
-        lin_vel_z = torch.abs(robot.data.root_lin_vel_b[:, 2])
-        ang_vel_xy = torch.linalg.norm(robot.data.root_ang_vel_b[:, :2], dim=1)
-        stable = (
-            (torch.abs(roll) <= self.sit_down_roll_pitch_thresh)
-            & (torch.abs(pitch) <= self.sit_down_roll_pitch_thresh)
-            & (lin_vel_z <= self.sit_down_height_vel_thresh)
-            & (ang_vel_xy <= self.sit_down_ang_vel_thresh)
-        )
-        return bool(torch.all(stable))
 
     def _action_tensor_to_output(self, action_env: torch.Tensor):
         return action_env.detach().cpu().numpy().tolist()
@@ -2956,7 +2850,6 @@ class AlgSolution:
                 else:
                     if robot is not None:
                         self._leg_posture_controller.start_crouch(robot)
-                        self._reset_sit_down_tracking()
                         self._pregrasp_navigator.nav_state = "CROUCHING"
                         print(
                             f"[GT-NAV] Started crouch before grasp for "
@@ -2969,23 +2862,8 @@ class AlgSolution:
             if robot is None:
                 self._pregrasp_navigator.finish_current_target("failed")
                 return {"action": self._get_stand_still_action(obs), "giveup": False}
-            if self.sit_down_actor is not None:
-                action_env = self._generate_sit_down_action_tensor(obs)
-                self._sit_down_step_count += 1
-                if self._is_sit_down_stable(robot):
-                    self._sit_down_stable_count += 1
-                else:
-                    self._sit_down_stable_count = 0
-                crouch_ready = (
-                    self._sit_down_step_count >= self.sit_down_min_steps
-                    and self._sit_down_stable_count >= self.sit_down_stable_steps_required
-                )
-                if crouch_ready:
-                    self._leg_posture_controller.state = "HOLDING_CROUCH"
-            else:
-                action_env = self._generate_control_action_tensor(obs, zero_cmd, robot)
-                crouch_ready = self._leg_posture_controller.state == "HOLDING_CROUCH"
-            if crouch_ready:
+            action_env = self._generate_control_action_tensor(obs, zero_cmd, robot)
+            if self._leg_posture_controller.state == "HOLDING_CROUCH":
                 if self._pregrasp_navigator.current_target is not None and arm_grasp_controller is not None:
                     trash_pos_w = self._pregrasp_navigator.current_target["pos_w"]
                     ee_quat_w = arm_grasp_controller.get_ee_pose()[1]
@@ -3002,7 +2880,6 @@ class AlgSolution:
                     )
                 elif arm_grasp_controller is None:
                     self._pending_grasp_status = "failed"
-                    self._reset_sit_down_tracking()
                     self._leg_posture_controller.start_stand_up(robot)
                     self._pregrasp_navigator.nav_state = "STAND_UP"
                     print("[GT-NAV] Arm grasp controller unavailable after crouch, standing up.", flush=True)
@@ -3027,7 +2904,6 @@ class AlgSolution:
 
             if grasp_done:
                 self._pending_grasp_status = "grasped" if grasp_success else "failed"
-                self._reset_sit_down_tracking()
                 self._leg_posture_controller.start_stand_up(robot)
                 self._pregrasp_navigator.nav_state = "STAND_UP"
                 print(
@@ -3045,7 +2921,6 @@ class AlgSolution:
                 return {"action": self._get_stand_still_action(obs), "giveup": False}
             action_env = self._generate_control_action_tensor(obs, zero_cmd, robot)
             if self._leg_posture_controller.state == "IDLE":
-                self._reset_sit_down_tracking()
                 self._pregrasp_navigator.finish_current_target(self._pending_grasp_status or "failed")
                 self._pending_grasp_status = None
             return {"action": self._action_tensor_to_output(action_env), "giveup": False}

@@ -30,6 +30,7 @@ parser.add_argument("--export_io_descriptors", action="store_true", default=Fals
 parser.add_argument(
     "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
 )
+parser.add_argument("--nowandb", action="store_true", default=False, help="Disable wandb logging and use tensorboard instead.")
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -191,11 +192,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
+    # handle --nowandb flag: disable wandb and use tensorboard
+    if args_cli.nowandb:
+        print("[INFO] Disabling wandb logging, using tensorboard instead.")
+        os.environ["WANDB_DISABLED"] = "true"
+        # Also set in agent config if available
+        if hasattr(agent_cfg, 'wandb'):
+            agent_cfg.wandb = None
+        # Update runner config to use tensorboard
+        runner_config = agent_cfg.to_dict()
+        runner_config.pop('wandb', None)
+    else:
+        runner_config = agent_cfg.to_dict()
+    
     # create runner from rsl-rl
     if agent_cfg.class_name == "OnPolicyRunner":
-        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+        runner = OnPolicyRunner(env, runner_config, log_dir=log_dir, device=agent_cfg.device)
     elif agent_cfg.class_name == "DistillationRunner":
-        runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+        runner = DistillationRunner(env, runner_config, log_dir=log_dir, device=agent_cfg.device)
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
     # write git state to logs

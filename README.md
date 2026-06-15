@@ -14,6 +14,7 @@ python scripts/rsl_rl/train.py --task ATEC-Isaac-Velocity-Flat-Unitree-B2-Piper-
 
 # 评估训练好的模型
 python scripts/rsl_rl/play.py --task ATEC-Isaac-Velocity-Flat-Unitree-B2-Piper-v0 --enable_cameras
+python scripts/rsl_rl/play.py --task ATEC-Isaac-Stand-Height-Flat-Unitree-B2-Piper-v0 --num_env 10 --checkpoint logs/rsl_rl/unitree_b2_piper_stand_height_flat/2026-06-12_09-08-46/model_900.pt
 
 ### 测试命令
 # 基础运行命令
