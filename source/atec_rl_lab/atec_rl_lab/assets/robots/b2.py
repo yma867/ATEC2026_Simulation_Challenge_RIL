@@ -85,7 +85,7 @@ UNITREE_B2_PIPER_CFG.init_state.joint_pos.update({
     "arm_joint2": 2.13,
     "arm_joint3": -1.20,
     "arm_joint4": 0.0,
-    "arm_joint5": -0.8,
+    "arm_joint5": -0.0,
     "arm_joint6": 0.0,
     "arm_joint7": 0.0,
     "arm_joint8": 0.0,

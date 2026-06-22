@@ -83,13 +83,18 @@ def play() -> tuple[float, float]:
         raise ValueError("Please provide --task, e.g. --task ATEC-TaskA-G1")
 
     is_task_e = isinstance(args_cli.task, str) and args_cli.task.startswith("ATEC-TaskE")
+    is_task_d = isinstance(args_cli.task, str) and args_cli.task.startswith("ATEC-TaskD")
     # -------------------------------------------------------------------------
-    # Initialize solution (dynamic import based on --gt_nav flag)
+    # Initialize solution (dynamic import based on task type and --gt_nav flag)
     # -------------------------------------------------------------------------
     global solution
     if args_cli.gt_nav:
         print("[INFO] Enabling GT Navigation mode")
         from demo.solution_gt import AlgSolution
+        solution = AlgSolution(env=None)
+    elif is_task_d:
+        print("[INFO] Using TaskD solution")
+        from demo.solution_taskd import AlgSolution
         solution = AlgSolution(env=None)
     else:
         from demo.solution import AlgSolution
