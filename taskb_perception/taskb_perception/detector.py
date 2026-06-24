@@ -27,9 +27,11 @@ class ObjectDetector:
     def __init__(self, cfg: PerceptionConfig, weights: str | Path | None = None):
         self.cfg = cfg
         self._yolo = None
+        self._weights_path: Path | None = None
         w = weights or cfg.yolo_head_weights or cfg.yolo_weights
         if w:
             weights_path = self._resolve_weights(w)
+            self._weights_path = weights_path
             if not weights_path.is_file():
                 print(f"[ObjectDetector] 权重不存在: {weights_path}，将使用颜色回退")
             else:
@@ -37,6 +39,11 @@ class ObjectDetector:
                     from ultralytics import YOLO
 
                     self._yolo = YOLO(str(weights_path))
+                    names = getattr(self._yolo, "names", None)
+                    print(
+                        f"[ObjectDetector] YOLO loaded: weights={weights_path} ",
+                        flush=True,
+                    )
                 except Exception as exc:
                     print(f"[ObjectDetector] YOLO 加载失败，将使用颜色回退: {exc}")
 
@@ -59,7 +66,8 @@ class ObjectDetector:
         return []
 
     def _detect_yolo(self, rgb: np.ndarray, depth: np.ndarray | None, *, require_depth: bool = True) -> list[Detection2D]:
-        results = self._yolo.predict(rgb, verbose=False, conf=self.cfg.conf_threshold)
+        bgr = rgb[..., ::-1]
+        results = self._yolo.predict(bgr, verbose=False, conf=self.cfg.conf_threshold, imgsz=640)
         dets: list[Detection2D] = []
         for r in results:
             if r.boxes is None:
@@ -76,7 +84,7 @@ class ObjectDetector:
                 if require_depth and d <= 0:
                     continue
                 if not require_depth and d <= 0:
-                    d = 1.0
+                    continue
                 cls_name = self.cfg.class_names.get(cls_id, "unknown")
                 obj_class = ObjectClass(cls_name) if cls_name in ObjectClass._value2member_map_ else ObjectClass.UNKNOWN
                 dets.append(
