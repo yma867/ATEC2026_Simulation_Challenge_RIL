@@ -37,7 +37,7 @@ except Exception:
 # 导航模式选择开关
 # 可选值: "nearest" - 找最近的目标; "order" - 按编号顺序 object1-18
 #        "keyboard" - Isaac/Omniverse 键盘手动控制（终端输入兜底）
-NAV_MODE = os.getenv("ATEC_TASKB_NAV_MODE", "nearest").lower()
+NAV_MODE = os.getenv("ATEC_TASKB_NAV_MODE", "keyboard").lower()
 assert NAV_MODE in ["nearest", "order", "keyboard"], (
     f"Invalid NAV_MODE: {NAV_MODE}. Must be 'nearest', 'order' or 'keyboard'"
 )
@@ -1965,17 +1965,19 @@ class AlgSolution:
         # 加载预训练模型（用于腿部控制）
         self._load_actor_model()
         
-        # End-effector 摄像头配置
+        # 摄像头配置
         self._enable_ee_camera = os.getenv("ATEC_TASKB_ENABLE_EE_CAM", "1").lower() in {"1", "true", "yes", "on"}
-        self._ee_cam_save_interval = int(os.getenv("ATEC_TASKB_EE_CAM_SAVE_INTERVAL", "50"))  # 每50帧保存一次
+        self._camera_save_interval = max(1, int(os.getenv("ATEC_TASKB_CAMERA_SAVE_INTERVAL", "10")))  # 每10帧保存一次
         self._ee_cam_display = os.getenv("ATEC_TASKB_EE_CAM_DISPLAY", "1").lower() in {"1", "true", "yes", "on"}
-        
+
         # 创建图像保存目录
+        self._head_cam_save_dir = os.path.join(REPO_ROOT, "logs", "head_camera")
         self._ee_cam_save_dir = os.path.join(REPO_ROOT, "logs", "ee_camera")
+        os.makedirs(self._head_cam_save_dir, exist_ok=True)
         os.makedirs(self._ee_cam_save_dir, exist_ok=True)
-        
+
         # 摄像头状态
-        self._last_ee_cam_save_time = time.time()
+        self._head_cam_frame_count = 0
         self._ee_cam_frame_count = 0
         self._camera_debug_interval = 5
         self._camera_debug_enabled = True
@@ -1989,8 +1991,9 @@ class AlgSolution:
         print(f"[GT-NAV] Angular vel range: {self.ang_vel_range}")
         print(f"[GT-NAV] Device: {self.device_str}")
         print(f"[GT-NAV] EE Camera: {'enabled' if self._enable_ee_camera else 'disabled'}")
-        print(f"[GT-NAV] EE Camera Save Interval: {self._ee_cam_save_interval} frames")
+        print(f"[GT-NAV] Camera Save Interval: {self._camera_save_interval} frames")
         print(f"[GT-NAV] EE Camera Display: {'enabled' if self._ee_cam_display else 'disabled'}")
+        print(f"[GT-NAV] Head Camera Save Dir: {self._head_cam_save_dir}")
         print(f"[GT-NAV] EE Camera Save Dir: {self._ee_cam_save_dir}")
 
     def _load_actor_model(self):
@@ -2622,14 +2625,47 @@ class AlgSolution:
         )
         return None
 
-    def _process_ee_camera(self, obs):
-        """
-        处理相机调试显示：head RGB、head depth、ee depth
-        """
-        if not self._camera_debug_enabled:
+    def _save_camera_rgb_frame(self, rgb_frame, camera_name: str, save_dir: str):
+        """按固定步长保存 RGB 图像。"""
+        if rgb_frame is None:
             return
 
-        if self._step_count % self._camera_debug_interval != 0:
+        if self._step_count % self._camera_save_interval != 0:
+            return
+
+        try:
+            bgr_image = rgb_to_bgr_uint8(rgb_frame)
+            file_path = os.path.join(save_dir, f"{camera_name}_{self._step_count:06d}.png")
+            if cv2 is not None:
+                success = cv2.imwrite(file_path, bgr_image)
+                if not success:
+                    self._warn_once(
+                        f"camera_save_failed_{camera_name}",
+                        f"[GT-NAV] Warning: failed to save {camera_name} frame to {file_path}",
+                    )
+                    return
+            else:
+                self._warn_once(
+                    f"camera_save_cv2_missing_{camera_name}",
+                    f"[GT-NAV] Warning: OpenCV unavailable, cannot save {camera_name} frames.",
+                )
+                return
+
+            if camera_name == "head_camera":
+                self._head_cam_frame_count += 1
+            elif camera_name == "ee_camera":
+                self._ee_cam_frame_count += 1
+        except Exception as e:
+            self._warn_once(
+                f"camera_save_runtime_error_{camera_name}",
+                f"[GT-NAV] Warning: failed to save {camera_name} frame due to error: {e}",
+            )
+
+    def _process_ee_camera(self, obs):
+        """
+        处理相机调试显示，并按固定间隔保存 head/ee RGB 图像。
+        """
+        if not self._enable_ee_camera:
             return
 
         if cv2 is None:
@@ -2647,16 +2683,19 @@ class AlgSolution:
             ee_rgb = self._get_camera_output(ee_camera, "ee_camera", "rgb") if ee_camera is not None else None
             ee_depth = self._get_camera_depth_output(ee_camera, "ee_camera") if ee_camera is not None else None
 
-            
-            if head_rgb is not None:
-                cv2.imshow("head_rgb", rgb_to_bgr_uint8(head_rgb))
-            # if head_depth is not None:
-            #     cv2.imshow("head_depth", depth_to_colormap(head_depth))
-            if ee_rgb is not None:
-                cv2.imshow("ee_rgb", rgb_to_bgr_uint8(ee_rgb))
-            # if ee_depth is not None:
-            #     cv2.imshow("ee_depth", depth_to_colormap(ee_depth))
-            cv2.waitKey(1)
+            self._save_camera_rgb_frame(head_rgb, "head_camera", self._head_cam_save_dir)
+            self._save_camera_rgb_frame(ee_rgb, "ee_camera", self._ee_cam_save_dir)
+
+            if self._camera_debug_enabled and self._step_count % self._camera_debug_interval == 0:
+                if head_rgb is not None:
+                    cv2.imshow("head_rgb", rgb_to_bgr_uint8(head_rgb))
+                # if head_depth is not None:
+                #     cv2.imshow("head_depth", depth_to_colormap(head_depth))
+                if ee_rgb is not None:
+                    cv2.imshow("ee_rgb", rgb_to_bgr_uint8(ee_rgb))
+                # if ee_depth is not None:
+                #     cv2.imshow("ee_depth", depth_to_colormap(ee_depth))
+                cv2.waitKey(1)
         except Exception as e:
             self._warn_once("camera_debug_runtime_error", f"[GT-NAV] Warning: camera debug display disabled due to error: {e}")
             self._camera_debug_enabled = False

@@ -37,7 +37,7 @@ except Exception:
 # 导航模式选择开关
 # 可选值: "nearest" - 找最近的目标; "order" - 按编号顺序 object1-18
 #        "keyboard" - Isaac/Omniverse 键盘手动控制（终端输入兜底）
-NAV_MODE = os.getenv("ATEC_TASKB_NAV_MODE", "nearest").lower()
+NAV_MODE = os.getenv("ATEC_TASKB_NAV_MODE", "keyboard").lower()
 assert NAV_MODE in ["nearest", "order", "keyboard"], (
     f"Invalid NAV_MODE: {NAV_MODE}. Must be 'nearest', 'order' or 'keyboard'"
 )
@@ -485,14 +485,14 @@ class PolicyNavigator:
     """
 
     def __init__(self, nav_mode: str = "nearest"):
-        self.stand_off = 0.6
+        self.stand_off = 0.3
         self.kp_pos = 1.2
         self.kp_yaw = 2.0
         self.max_vx = 0.8
         self.max_vy = 0.25
         self.max_yaw_rate = 0.8
-        self.pos_tol = 0.32
-        self.yaw_tol = 0.087
+        self.pos_tol = 0.26
+        self.yaw_tol = 0.35
         self.slow_radius = 0.5
 
         self.nav_mode = nav_mode
@@ -514,7 +514,12 @@ class PolicyNavigator:
         vy_body = -sin_yaw * vx_world + cos_yaw * vy_world
         return vx_body, vy_body
 
-    def compute_pregrasp_pose(self, robot_pos_w: np.ndarray, trash_pos_w: np.ndarray) -> tuple:
+    def compute_pregrasp_pose(
+        self,
+        robot_pos_w: np.ndarray,
+        trash_pos_w: np.ndarray,
+        arm_base_offset_b: np.ndarray | None = None,
+    ) -> tuple:
         robot_xy = robot_pos_w[:2]
         trash_xy = trash_pos_w[:2]
         direction = robot_xy - trash_xy
@@ -523,10 +528,25 @@ class PolicyNavigator:
             direction = np.array([1.0, 0.0])
             norm = 1.0
         direction_normalized = direction / norm
-        goal_xy = trash_xy + direction_normalized * self.stand_off
-        dx = trash_pos_w[0] - goal_xy[0]
-        dy = trash_pos_w[1] - goal_xy[1]
+        arm_base_goal_xy = trash_xy + direction_normalized * self.stand_off
+        dx = trash_pos_w[0] - arm_base_goal_xy[0]
+        dy = trash_pos_w[1] - arm_base_goal_xy[1]
         goal_yaw = math.atan2(dy, dx)
+        if arm_base_offset_b is None:
+            goal_xy = arm_base_goal_xy
+        else:
+            arm_base_offset_b = np.asarray(arm_base_offset_b, dtype=np.float32)
+            offset_xy_b = arm_base_offset_b[:2]
+            cos_yaw = math.cos(goal_yaw)
+            sin_yaw = math.sin(goal_yaw)
+            offset_xy_w = np.array(
+                [
+                    cos_yaw * offset_xy_b[0] - sin_yaw * offset_xy_b[1],
+                    sin_yaw * offset_xy_b[0] + cos_yaw * offset_xy_b[1],
+                ],
+                dtype=np.float32,
+            )
+            goal_xy = arm_base_goal_xy - offset_xy_w
         return goal_xy, goal_yaw
 
     def select_nearest_target(self, trash_targets: list, robot_pos_w: np.ndarray) -> dict | None:
@@ -543,7 +563,17 @@ class PolicyNavigator:
                 candidates.append((dist, trash))
         if not candidates:
             return None
+        
+        # 按距离排序
         candidates.sort(key=lambda x: x[0])
+        
+        # 跳过距离小于0.6m的物体，找下一个最近的
+        MIN_DISTANCE = 0.6
+        for dist, trash in candidates:
+            if dist >= MIN_DISTANCE:
+                return trash
+        
+        # 如果所有物体都小于0.4m，返回最近的那个
         return candidates[0][1]
 
     def select_order_target(self, trash_targets: list) -> dict | None:
@@ -580,25 +610,60 @@ class PolicyNavigator:
                 vy_body = 0.0
                 yaw_rate = self.kp_yaw * yaw_error
                 yaw_rate = max(-self.max_yaw_rate, min(self.max_yaw_rate, yaw_rate))
+                
+                # 添加最小旋转速度阈值，避免过小的旋转命令
+                MIN_YAW_RATE = 0.3
+                if abs(yaw_rate) < MIN_YAW_RATE and abs(yaw_rate) > 0:
+                    yaw_rate = MIN_YAW_RATE * np.sign(yaw_rate)
+                
                 arrived = False
             else:
                 vx_w = self.kp_pos * error_xy_w[0]
                 vy_w = self.kp_pos * error_xy_w[1]
+                
+                # 计算当前速度（减速前）
+                vx_body_raw, vy_body_raw = self._world_to_body_velocity(vx_w, vy_w, robot_yaw)
+                speed_raw = np.sqrt(vx_body_raw**2 + vy_body_raw**2)
+                
+                # 减速逻辑：确保减速后速度不低于训练时的最小阈值 0.1
+                MIN_TRAIN_VELOCITY = 0.1
                 if pos_error_norm < self.slow_radius:
                     decel_ratio = pos_error_norm / self.slow_radius
+                    # 确保减速后速度不低于 MIN_TRAIN_VELOCITY
+                    if speed_raw * decel_ratio < MIN_TRAIN_VELOCITY and speed_raw > MIN_TRAIN_VELOCITY:
+                        decel_ratio = MIN_TRAIN_VELOCITY / speed_raw
                     vx_w *= decel_ratio
                     vy_w *= decel_ratio
+                
                 vx_body, vy_body = self._world_to_body_velocity(vx_w, vy_w, robot_yaw)
                 vx_body = max(-self.max_vx, min(self.max_vx, vx_body))
                 vy_body = max(-self.max_vy, min(self.max_vy, vy_body))
+                
+                # 添加最小速度阈值，避免过小的速度命令（训练时屏蔽了<0.2的命令）
+                MIN_VELOCITY = MIN_TRAIN_VELOCITY
+                if abs(vx_body) < MIN_VELOCITY and abs(vy_body) < MIN_VELOCITY:
+                    vx_body = 0.0
+                    vy_body = 0.0
+                
                 yaw_rate = self.kp_yaw * yaw_error * 0.3
                 yaw_rate = max(-self.max_yaw_rate, min(self.max_yaw_rate, yaw_rate))
-                arrived = pos_error_norm < self.pos_tol
+                
+                # 添加最小旋转速度阈值，避免过小的旋转命令
+                MIN_YAW_RATE = 0.2
+                if abs(yaw_rate) < MIN_YAW_RATE and abs(yaw_rate) > 0:
+                    yaw_rate = MIN_YAW_RATE * np.sign(yaw_rate)
+                arrived = pos_error_norm < self.pos_tol and abs(yaw_error) < self.yaw_tol
         elif self.nav_state == "ALIGN_TO_TRASH":
             vx_body = 0.0
             vy_body = 0.0
             yaw_rate = self.kp_yaw * yaw_error
             yaw_rate = max(-self.max_yaw_rate, min(self.max_yaw_rate, yaw_rate))
+            
+            # 添加最小旋转速度阈值，避免过小的旋转命令
+            MIN_YAW_RATE = 0.3
+            if abs(yaw_rate) < MIN_YAW_RATE and abs(yaw_rate) > 0:
+                yaw_rate = MIN_YAW_RATE * np.sign(yaw_rate)
+            
             arrived = abs(yaw_error) < self.yaw_tol
         else:
             vx_body = 0.0
@@ -615,7 +680,13 @@ class PolicyNavigator:
         }
         return (vx_body, vy_body, yaw_rate), nav_info
 
-    def update(self, robot_pos_w: np.ndarray, robot_yaw: float, trash_targets: list) -> tuple:
+    def update(
+        self,
+        robot_pos_w: np.ndarray,
+        robot_yaw: float,
+        trash_targets: list,
+        arm_base_offset_b: np.ndarray | None = None,
+    ) -> tuple:
         """
         状态机更新。返回 (base_cmd, nav_info)。
         base_cmd = np.array([vx, vy, yaw_rate])，由上层送入 policy 网络。
@@ -637,7 +708,11 @@ class PolicyNavigator:
             return zero_cmd, {"state": "SELECT_TARGET", "arrived": False}
 
         if self.nav_state == "COMPUTE_PREGRASP_POSE":
-            self.goal_xy, self.goal_yaw = self.compute_pregrasp_pose(robot_pos_w, self.current_target["pos_w"])
+            self.goal_xy, self.goal_yaw = self.compute_pregrasp_pose(
+                robot_pos_w,
+                self.current_target["pos_w"],
+                arm_base_offset_b=arm_base_offset_b,
+            )
             print(f"[PolicyNavigator] Computed pregrasp pose: goal_xy={self.goal_xy}, goal_yaw={math.degrees(self.goal_yaw):.1f}°", flush=True)
             self.nav_state = "NAVIGATE_TO_PREGRASP"
             return zero_cmd, {"state": "COMPUTE_PREGRASP_POSE", "arrived": False}
@@ -697,12 +772,12 @@ class ArmGraspController:
         gripper_joint_names: list[str],
         ee_body_name: str = "gripper_base",
         action_scale: float = 0.5,
-        pregrasp_height: float = 0.20,
+        pregrasp_height: float = 0.15,
         grasp_height_offset: float = 0.03,
         lift_height: float = 0.30,
         ee_pos_tol: float = 0.05,
         gripper_close_wait_steps: int = 30,
-        lift_success_threshold: float = 0.10,
+        lift_success_threshold: float = 0.20,
         gripper_open_pos: tuple[float, float] = (0.035, -0.035),
         gripper_close_pos: tuple[float, float] = (-0.015, 0.015),
         log_every_steps: int = 10,
@@ -722,6 +797,12 @@ class ArmGraspController:
         self.gripper_open_pos = torch.tensor(gripper_open_pos, dtype=torch.float32, device=device)
         self.gripper_close_pos = torch.tensor(gripper_close_pos, dtype=torch.float32, device=device)
         self.log_every_steps = max(1, int(log_every_steps))
+        self.stable_steps_required = max(1, int(os.getenv("ATEC_TASKB_ARM_STABLE_STEPS", "4")))
+        self.max_phase_steps = max(1, int(os.getenv("ATEC_TASKB_ARM_MAX_PHASE_STEPS", "200")))
+        self.ik_max_iters = max(1, int(os.getenv("ATEC_TASKB_ARM_IK_MAX_ITERS", "3")))
+
+        # 时间步长，用于笛卡尔空间速度限制
+        self.dt = float(os.getenv("ATEC_TASKB_SIM_DT", "0.02"))
 
         self.arm_joint_ids, _ = robot.find_joints(self.arm_joint_names)
         self.gripper_joint_ids, _ = robot.find_joints(self.gripper_joint_names)
@@ -732,15 +813,17 @@ class ArmGraspController:
             print("[ArmGraspController] Warning: CartesianController unavailable, grasping will fail closed.", flush=True)
         else:
             try:
+                # max_joint_delta controls arm movement speed - smaller = slower/more stable
+                max_joint_delta = float(os.getenv("ATEC_TASKB_ARM_MAX_JOINT_DELTA", "0.05"))
                 self.cartesian = CartesianController(
                     robot=robot,
                     ee_body_name=ee_body_name,
                     arm_joint_names=self.arm_joint_names,
                     num_envs=1,
                     device=str(device),
-                    command_type="position",
+                    command_type="pose",
                     lambda_val=0.1,
-                    max_joint_delta=0.2,
+                    max_joint_delta=max_joint_delta,
                 )
                 self.cartesian.reset()
             except Exception as exc:
@@ -761,10 +844,16 @@ class ArmGraspController:
         self.initial_trash_z = None
         self.wait_steps = 0
         self.step_counter = 0
+        self.phase_step_counter = 0
+        self.phase_stable_counter = 0
         self.success = False
         self.failure_reason = None
         self.desired_arm_joint_pos = None
         self.desired_gripper_joint_pos = self.gripper_open_pos.clone()
+        self.current_target_pos_w = None
+        self.current_target_pos_b = None
+        self.current_target_pos_b_raw = None
+        self.current_target_pos_w_compensated = None
         if self.cartesian is not None:
             self.cartesian.reset()
 
@@ -783,36 +872,45 @@ class ArmGraspController:
         else:
             ee_quat_w = np.asarray(current_ee_quat_w, dtype=np.float32)
         self.target_ee_quat_w = ee_quat_w.copy()
-        self.state = "MOVE_TO_PREGRASP"
+        self._refresh_target_poses(scene=None)
+        self._set_state("MOVE_TO_PREGRASP")
         self._log(force=True, extra="start_grasp")
 
     def step(self, robot, scene, sim_dt):
         del sim_dt
         self.robot = robot
         self.step_counter += 1
+        self.phase_step_counter += 1
 
         if self.state == "IDLE":
             return False, False
         if self.cartesian is None:
             self.failure_reason = "ik_unavailable"
-            self.state = "FAILED"
+            self._set_state("FAILED")
             self._log(force=True, extra="IK unavailable")
             return True, False
 
+        self._refresh_target_poses(scene)
         ee_pos_w, _ = self.get_ee_pose()
+
+        if self._phase_timed_out():
+            self.failure_reason = f"phase_timeout state={self.state} steps={self.phase_step_counter}"
+            self._set_state("FAILED")
+            self._log(force=True, extra="Phase timeout")
+            return True, False
 
         if self.state == "MOVE_TO_PREGRASP":
             self.open_gripper()
             self.move_ee_to_pose(self.pregrasp_pos_w, self.target_ee_quat_w)
-            if self.ee_reached(ee_pos_w, self.pregrasp_pos_w):
-                self.state = "MOVE_DOWN_TO_GRASP"
+            if self._update_stable_reached(self.ee_reached(ee_pos_w, self.pregrasp_pos_w)):
+                self._set_state("MOVE_DOWN_TO_GRASP")
                 self._log(force=True, extra="Reached pregrasp")
 
         elif self.state == "MOVE_DOWN_TO_GRASP":
             self.open_gripper()
             self.move_ee_to_pose(self.grasp_pos_w, self.target_ee_quat_w)
-            if self.ee_reached(ee_pos_w, self.grasp_pos_w):
-                self.state = "CLOSE_GRIPPER"
+            if self._update_stable_reached(self.ee_reached(ee_pos_w, self.grasp_pos_w)):
+                self._set_state("CLOSE_GRIPPER")
                 self.wait_steps = 0
                 self._log(force=True, extra="Reached grasp pose")
 
@@ -820,20 +918,20 @@ class ArmGraspController:
             self.close_gripper()
             self.wait_steps += 1
             if self.wait_steps >= self.gripper_close_wait_steps:
-                self.state = "LIFT_OBJECT"
+                self._set_state("LIFT_OBJECT")
                 self._log(force=True, extra="Gripper close wait finished")
 
         elif self.state == "LIFT_OBJECT":
             self.close_gripper()
             self.move_ee_to_pose(self.lift_pos_w, self.target_ee_quat_w)
-            if self.ee_reached(ee_pos_w, self.lift_pos_w):
-                self.state = "VERIFY_GRASP"
+            if self._update_stable_reached(self.ee_reached(ee_pos_w, self.lift_pos_w)):
+                self._set_state("VERIFY_GRASP")
                 self._log(force=True, extra="Reached lift pose")
 
         elif self.state == "VERIFY_GRASP":
             self.close_gripper()
             self.success = self.check_grasp_success(scene)
-            self.state = "DONE" if self.success else "FAILED"
+            self._set_state("DONE" if self.success else "FAILED")
             self._log(force=True, extra=f"verify success={self.success}")
 
         elif self.state == "DONE":
@@ -848,15 +946,52 @@ class ArmGraspController:
     def move_ee_to_pose(self, target_pos_w, target_quat_w=None):
         if self.cartesian is None:
             return
-        target_pos = torch.as_tensor(target_pos_w, dtype=torch.float32, device=self.device).view(1, 3)
-        if self.cartesian.command_type == "position":
-            self.desired_arm_joint_pos = self.cartesian.compute(target_pos).detach().clone()
+
+        self.current_target_pos_w = np.asarray(target_pos_w, dtype=np.float32)
+        self.current_target_pos_w_compensated = self.current_target_pos_w.copy()
+        raw_target_pos_b = self._world_pos_to_base_frame(self.current_target_pos_w)
+        self.current_target_pos_b_raw = None if raw_target_pos_b is None else raw_target_pos_b.detach().cpu().numpy()[0]
+
+        # Compensate for gripper_base to fingertip offset
+        # gripper_base origin is at the base of the gripper, but fingertips extend
+        # 0.1358m along gripper_base's local Z axis. We need to move gripper_base
+        # BACKWARD so that fingertips end up at the target position.
+        ee_pos_w, ee_quat_w = self.get_ee_pose()
+        ee_quat_t = torch.tensor(ee_quat_w, dtype=torch.float32, device=self.device).unsqueeze(0)
+        # gripper_base local Z axis in world frame
+        local_z = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=self.device).unsqueeze(0)
+        from isaaclab.utils.math import quat_rotate
+        z_world = quat_rotate(ee_quat_t, local_z).squeeze(0).cpu().numpy()
+        # Offset gripper_base backward along its Z axis so fingertips reach target
+        finger_offset = float(os.getenv("ATEC_TASKB_FINGER_OFFSET", "0.12"))
+        disable_finger_comp = os.getenv("ATEC_TASKB_DISABLE_FINGER_COMP", "1").lower() in {"1", "true", "yes", "on"}
+        if disable_finger_comp:
+            compensated_target = np.asarray(target_pos_w, dtype=np.float32)
         else:
-            target_quat = torch.as_tensor(target_quat_w, dtype=torch.float32, device=self.device).view(1, 4)
-            self.desired_arm_joint_pos = self.cartesian.compute(target_pos, target_quat).detach().clone()
+            compensated_target = np.asarray(target_pos_w, dtype=np.float32) - z_world * finger_offset
+        self.current_target_pos_w_compensated = compensated_target.copy()
+
+        target_pos_b = self._world_pos_to_base_frame(compensated_target)
+        self.current_target_pos_b = None if target_pos_b is None else target_pos_b.detach().cpu().numpy()[0]
+        if target_pos_b is None:
+            return
+
+        if target_quat_w is None:
+            target_quat_w = self._compute_top_down_target_quat_w(compensated_target)
+        target_quat_b = self._world_quat_to_base_frame(target_quat_w)
+        if target_quat_b is None:
+            return
+        self.desired_arm_joint_pos = self.cartesian.compute_base(target_pos_b, target_quat_b).detach().clone()
 
     def ee_reached(self, ee_pos_w, target_pos_w):
-        pos_err = float(np.linalg.norm(np.asarray(ee_pos_w) - np.asarray(target_pos_w)))
+        finger_offset = float(os.getenv("ATEC_TASKB_FINGER_OFFSET", "0.12"))
+        ee_quat_w_val = self.get_ee_pose()[1]
+        ee_quat_t = torch.tensor(ee_quat_w_val, dtype=torch.float32, device=self.device).unsqueeze(0)
+        local_z = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=self.device).unsqueeze(0)
+        from isaaclab.utils.math import quat_rotate
+        z_world = quat_rotate(ee_quat_t, local_z).squeeze(0).cpu().numpy()
+        fingertip_pos = np.asarray(ee_pos_w) + z_world * finger_offset
+        pos_err = float(np.linalg.norm(fingertip_pos - np.asarray(target_pos_w)))
         return pos_err < self.ee_pos_tol
 
     def open_gripper(self):
@@ -926,6 +1061,12 @@ class ArmGraspController:
             gripper_target = self.desired_gripper_joint_pos.to(device=action_env.device, dtype=action_env.dtype).view(1, -1)
 
         default_joint_pos = robot.data.default_joint_pos.to(device=action_env.device, dtype=action_env.dtype)
+        # 使用 b2_piper_arm_defaults 覆盖机械臂默认位置
+        if hasattr(self, 'b2_piper_arm_defaults'):
+            for name, pos in self.b2_piper_arm_defaults.items():
+                if name in self.arm_joint_names:
+                    idx = self.arm_joint_names.index(name)
+                    default_joint_pos[:, self.arm_joint_ids[idx]] = pos
         action_env[:, self.arm_joint_ids] = (arm_target - default_joint_pos[:, self.arm_joint_ids]) / self.action_scale
         action_env[:, self.gripper_joint_ids] = (gripper_target - default_joint_pos[:, self.gripper_joint_ids]) / self.action_scale
         return action_env
@@ -942,14 +1083,42 @@ class ArmGraspController:
         elif self.state in {"LIFT_OBJECT", "VERIFY_GRASP", "DONE", "FAILED"}:
             target_pos = self.lift_pos_w
         pos_err = None if target_pos is None else float(np.linalg.norm(np.asarray(ee_pos_w) - np.asarray(target_pos)))
+        finger_offset = float(os.getenv("ATEC_TASKB_FINGER_OFFSET", "0.1358"))
+        ee_quat_w_val = self.get_ee_pose()[1]
+        ee_quat_t = torch.tensor(ee_quat_w_val, dtype=torch.float32, device=self.device).unsqueeze(0)
+        local_z = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=self.device).unsqueeze(0)
+        from isaaclab.utils.math import quat_rotate
+        z_world = quat_rotate(ee_quat_t, local_z).squeeze(0).cpu().numpy()
+        fingertip_pos = np.asarray(ee_pos_w) + z_world * finger_offset
+        fingertip_err = None if target_pos is None else float(np.linalg.norm(fingertip_pos - np.asarray(target_pos)))
+        current_arm_joint_pos = None
+        desired_arm_joint_pos = None
+        arm_joint_delta = None
+        if self.robot is not None and hasattr(self.robot, "data") and hasattr(self.robot.data, "joint_pos"):
+            current_arm_joint_pos = (
+                self.robot.data.joint_pos[0, self.arm_joint_ids].detach().cpu().numpy().astype(np.float32)
+            )
+        if self.desired_arm_joint_pos is not None:
+            desired_arm_joint_pos = self.desired_arm_joint_pos[0].detach().cpu().numpy().astype(np.float32)
+        if current_arm_joint_pos is not None and desired_arm_joint_pos is not None:
+            arm_joint_delta = desired_arm_joint_pos - current_arm_joint_pos
         msg = (
             f"[ArmGraspController] state={self.state} target={self.current_target_id} "
             f"trash_pos_w={None if self.trash_pos_w is None else np.round(self.trash_pos_w, 3)} "
             f"pregrasp_pos_w={None if self.pregrasp_pos_w is None else np.round(self.pregrasp_pos_w, 3)} "
             f"grasp_pos_w={None if self.grasp_pos_w is None else np.round(self.grasp_pos_w, 3)} "
             f"lift_pos_w={None if self.lift_pos_w is None else np.round(self.lift_pos_w, 3)} "
+            f"target_pos_w_comp={None if self.current_target_pos_w_compensated is None else np.round(self.current_target_pos_w_compensated, 3)} "
+            f"target_pos_b_raw={None if self.current_target_pos_b_raw is None else np.round(self.current_target_pos_b_raw, 3)} "
+            f"target_pos_b={None if self.current_target_pos_b is None else np.round(self.current_target_pos_b, 3)} "
             f"current_ee_pos_w={np.round(ee_pos_w, 3)} "
             f"ee_pos_err={None if pos_err is None else round(pos_err, 4)} "
+            f"fingertip_err={None if fingertip_err is None else round(fingertip_err, 4)} "
+            f"arm_q={None if current_arm_joint_pos is None else np.round(current_arm_joint_pos, 4)} "
+            f"arm_q_des={None if desired_arm_joint_pos is None else np.round(desired_arm_joint_pos, 4)} "
+            f"arm_dq={None if arm_joint_delta is None else np.round(arm_joint_delta, 4)} "
+            f"stable={self.phase_stable_counter}/{self.stable_steps_required} "
+            f"phase_steps={self.phase_step_counter}/{self.max_phase_steps} "
             f"gripper_cmd={'close' if torch.allclose(self.desired_gripper_joint_pos, self.gripper_close_pos) else 'open'}"
         )
         if extra:
@@ -958,69 +1127,271 @@ class ArmGraspController:
             msg += f" failure={self.failure_reason}"
         print(msg, flush=True)
 
+    def _set_state(self, new_state: str):
+        if self.state != new_state:
+            self.phase_step_counter = 0
+            self.phase_stable_counter = 0
+        self.state = new_state
+
+    def _phase_timed_out(self) -> bool:
+        if self.state in {"DONE", "FAILED", "IDLE"}:
+            return False
+        phase_limit = self.max_phase_steps
+        if self.state == "CLOSE_GRIPPER":
+            phase_limit = max(phase_limit, self.gripper_close_wait_steps + self.stable_steps_required)
+        return self.phase_step_counter >= phase_limit
+
+    def _update_stable_reached(self, reached: bool) -> bool:
+        if reached:
+            self.phase_stable_counter += 1
+        else:
+            self.phase_stable_counter = 0
+        return self.phase_stable_counter >= self.stable_steps_required
+
+    def _refresh_target_poses(self, scene):
+        if self.current_target_id is not None and scene is not None:
+            current_trash_pos_w = self.get_current_trash_pos_w(scene)
+            if current_trash_pos_w is not None:
+                self.trash_pos_w = np.asarray(current_trash_pos_w, dtype=np.float32)
+        if self.trash_pos_w is None:
+            return
+        self.pregrasp_pos_w = self.trash_pos_w + np.array([0.0, 0.0, self.pregrasp_height], dtype=np.float32)
+        self.grasp_pos_w = self.trash_pos_w + np.array([0.0, 0.0, self.grasp_height_offset], dtype=np.float32)
+        self.lift_pos_w = self.trash_pos_w + np.array([0.0, 0.0, self.lift_height], dtype=np.float32)
+
+    def _world_pos_to_base_frame(self, target_pos_w) -> torch.Tensor | None:
+        if self.robot is None or not hasattr(self.robot.data, "root_pose_w"):
+            return None
+        from isaaclab.utils.math import quat_rotate_inverse as _quat_rotate_inverse
+
+        root_pos_w = self.robot.data.root_pose_w[:, :3]
+        root_quat_w = self.robot.data.root_pose_w[:, 3:]
+        target_pos_t = torch.as_tensor(target_pos_w, dtype=torch.float32, device=self.device).view(1, 3)
+        return _quat_rotate_inverse(root_quat_w, target_pos_t - root_pos_w)
+
+    def _world_quat_to_base_frame(self, target_quat_w) -> torch.Tensor | None:
+        if target_quat_w is None or self.robot is None or not hasattr(self.robot.data, "root_pose_w"):
+            return None
+        from isaaclab.utils.math import quat_conjugate as _quat_conjugate, quat_mul as _quat_mul
+
+        root_quat_w = self.robot.data.root_pose_w[:, 3:]
+        target_quat_t = torch.as_tensor(target_quat_w, dtype=torch.float32, device=self.device).view(1, 4)
+        return _quat_mul(_quat_conjugate(root_quat_w), target_quat_t)
+
+    def _compute_top_down_target_quat_w(self, target_pos_w) -> np.ndarray | None:
+        if self.robot is None or target_pos_w is None:
+            return None
+
+        arm_base_pos_w = None
+        try:
+            arm_base_body_ids, _ = self.robot.find_bodies("arm_base")
+            if len(arm_base_body_ids) > 0:
+                arm_base_pos_w = self.robot.data.body_pos_w[0, arm_base_body_ids[0], :3].detach().cpu().numpy()
+        except Exception:
+            arm_base_pos_w = None
+
+        if arm_base_pos_w is None:
+            arm_base_pos_w = self.robot.data.root_pos_w[0, :3].detach().cpu().numpy()
+
+        target_pos_w = np.asarray(target_pos_w, dtype=np.float32)
+        horizontal_dir = target_pos_w[:2] - arm_base_pos_w[:2]
+        horizontal_norm = float(np.linalg.norm(horizontal_dir))
+        if horizontal_norm < 1.0e-6:
+            root_quat_w = self.robot.data.root_quat_w[0].detach().cpu().numpy()
+            yaw = math.atan2(
+                2.0 * (root_quat_w[0] * root_quat_w[3] + root_quat_w[1] * root_quat_w[2]),
+                1.0 - 2.0 * (root_quat_w[2] ** 2 + root_quat_w[3] ** 2),
+            )
+            x_axis_w = np.array([math.cos(yaw), math.sin(yaw), 0.0], dtype=np.float32)
+        else:
+            x_axis_w = np.array(
+                [horizontal_dir[0] / horizontal_norm, horizontal_dir[1] / horizontal_norm, 0.0],
+                dtype=np.float32,
+            )
+
+        z_axis_w = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        y_axis_w = np.cross(z_axis_w, x_axis_w)
+        y_norm = float(np.linalg.norm(y_axis_w))
+        if y_norm < 1.0e-6:
+            y_axis_w = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        else:
+            y_axis_w = y_axis_w / y_norm
+        x_axis_w = np.cross(y_axis_w, z_axis_w)
+        x_axis_w = x_axis_w / max(float(np.linalg.norm(x_axis_w)), 1.0e-6)
+
+        rot_mat = np.stack([x_axis_w, y_axis_w, z_axis_w], axis=1)
+        return self._rotation_matrix_to_quat_wxyz(rot_mat)
+
+    def _rotation_matrix_to_quat_wxyz(self, rot_mat: np.ndarray) -> np.ndarray:
+        m = np.asarray(rot_mat, dtype=np.float32)
+        trace = float(np.trace(m))
+        if trace > 0.0:
+            s = math.sqrt(trace + 1.0) * 2.0
+            qw = 0.25 * s
+            qx = (m[2, 1] - m[1, 2]) / s
+            qy = (m[0, 2] - m[2, 0]) / s
+            qz = (m[1, 0] - m[0, 1]) / s
+        elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+            s = math.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
+            qw = (m[2, 1] - m[1, 2]) / s
+            qx = 0.25 * s
+            qy = (m[0, 1] + m[1, 0]) / s
+            qz = (m[0, 2] + m[2, 0]) / s
+        elif m[1, 1] > m[2, 2]:
+            s = math.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
+            qw = (m[0, 2] - m[2, 0]) / s
+            qx = (m[0, 1] + m[1, 0]) / s
+            qy = 0.25 * s
+            qz = (m[1, 2] + m[2, 1]) / s
+        else:
+            s = math.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
+            qw = (m[1, 0] - m[0, 1]) / s
+            qx = (m[0, 2] + m[2, 0]) / s
+            qy = (m[1, 2] + m[2, 1]) / s
+            qz = 0.25 * s
+        quat = np.array([qw, qx, qy, qz], dtype=np.float32)
+        quat /= max(float(np.linalg.norm(quat)), 1.0e-6)
+        return quat
+
 
 class LegPostureController:
-    """基于 smoothstep + PD torque 的腿部蹲下控制器。"""
+    """基于足端保持 + 位置 IK 的稳定下蹲控制器。"""
 
     def __init__(
         self,
         leg_joint_names: list[str],
-        front_crouch_thigh: float = 0.35,
-        front_crouch_calf: float = -1.45,
-        rear_crouch_thigh: float = 0.5,
-        rear_crouch_calf: float = -1.65,
-        crouch_duration: float = 2.5,
-        stand_up_duration: float = 2.5,
-        joint_error_tol: float = 0.12,
+        foot_body_names: tuple[str, str, str, str] = ("FR_foot", "FL_foot", "RR_foot", "RL_foot"),
+        crouch_drop_height: float = 0.10,
+        crouch_duration: float = 2.0,
+        stand_up_duration: float = 2.0,
+        foot_pos_tol: float = 0.03,
+        body_height_tol: float = 0.02,
+        ik_damping: float = 0.08,
+        max_joint_step: float = 0.08,
+        max_height_step: float | None = None,
+        max_rp: float | None = None,
+        max_ik_tracking_error: float | None = None,
+        max_ik_target_error: float | None = None,
+        foot_error_pause_thresh: float | None = None,
+        debug_interval: int | None = None,
     ):
         self.leg_joint_names = list(leg_joint_names)
-        self.front_crouch_thigh = float(front_crouch_thigh)
-        self.front_crouch_calf = float(front_crouch_calf)
-        self.rear_crouch_thigh = float(rear_crouch_thigh)
-        self.rear_crouch_calf = float(rear_crouch_calf)
+        self.foot_body_names = list(foot_body_names)
+        self.crouch_drop_height = max(float(crouch_drop_height), 0.0)
         self.crouch_duration = max(float(crouch_duration), 1.0e-3)
         self.stand_up_duration = max(float(stand_up_duration), 1.0e-3)
-        self.joint_error_tol = float(joint_error_tol)
+        self.foot_pos_tol = float(foot_pos_tol)
+        self.body_height_tol = float(body_height_tol)
+        self.ik_damping = max(float(ik_damping), 1.0e-6)
+        self.max_joint_step = max(float(max_joint_step), 1.0e-4)
+        if max_height_step is None:
+            max_height_step = float(os.getenv("ATEC_TASKB_CROUCH_MAX_HEIGHT_STEP", "0.002"))
+        if max_rp is None:
+            max_rp = float(os.getenv("ATEC_TASKB_CROUCH_MAX_RP", "0.15"))
+        if max_ik_tracking_error is None:
+            max_ik_tracking_error = float(os.getenv("ATEC_TASKB_CROUCH_MAX_IK_TRACKING_ERROR", "0.12"))
+        if max_ik_target_error is None:
+            max_ik_target_error = float(os.getenv("ATEC_TASKB_CROUCH_MAX_IK_TARGET_ERROR", "0.10"))
+        if foot_error_pause_thresh is None:
+            foot_error_pause_thresh = float(os.getenv("ATEC_TASKB_CROUCH_FOOT_ERROR_PAUSE_THRESH", "0.05"))
+        if debug_interval is None:
+            debug_interval = int(os.getenv("ATEC_TASKB_CROUCH_DEBUG_INTERVAL", "10"))
+        self.max_height_step = max(float(max_height_step), 1.0e-6)
+        self.max_rp = max(float(max_rp), 1.0e-6)
+        self.max_ik_tracking_error = max(float(max_ik_tracking_error), self.max_joint_step)
+        self.max_ik_target_error = max(float(max_ik_target_error), self.max_joint_step)
+        self.foot_error_pause_thresh = max(float(foot_error_pause_thresh), self.foot_pos_tol)
+        self.debug_interval = max(int(debug_interval), 1)
         self.state = "IDLE"
         self._leg_joint_ids = None
         self._leg_joint_names_in_robot = None
+        self._leg_groups = []
+        self._foot_body_ids = []
         self._initialized = False
         self._last_episode_length_buf = None
         self._phase_start_step = None
         self._phase_start_dof_pos = None
+        self._phase_start_root_height = None
+        self._phase_goal_root_height = None
+        self._phase_target_foot_pos_w = None
+        self._stand_root_height = None
         self._stand_dof_pos = None
         self._squat_dof_pos = None
+        self._hold_dof_pos = None
+        self._ik_target_dof_pos = None
+        self._commanded_root_height = None
         self._last_alpha = None
+        self._last_desired_root_height = None
+        self._last_height_error = None
+        self._last_max_foot_error = None
+        self._last_roll = None
+        self._last_pitch = None
+        self._last_unstable = None
+        self._last_paused = None
+        self._last_leg_delta_pre_clamp = None
+        self._last_leg_delta_post_clamp = None
+        self._last_max_abs_tracking_error = None
+        self._last_max_abs_target_error = None
 
     def reset(self):
         self.state = "IDLE"
         self._phase_start_step = None
         self._phase_start_dof_pos = None
+        self._phase_start_root_height = None
+        self._phase_goal_root_height = None
+        self._phase_target_foot_pos_w = None
+        self._hold_dof_pos = None
+        self._ik_target_dof_pos = None
+        self._commanded_root_height = None
         self._last_alpha = None
+        self._last_desired_root_height = None
+        self._last_height_error = None
+        self._last_max_foot_error = None
+        self._last_roll = None
+        self._last_pitch = None
+        self._last_unstable = None
+        self._last_paused = None
+        self._last_leg_delta_pre_clamp = None
+        self._last_leg_delta_post_clamp = None
+        self._last_max_abs_tracking_error = None
+        self._last_max_abs_target_error = None
 
     def start_crouch(self, robot):
         self._ensure_initialized(robot)
         self._sync_episode_reset(robot)
-        self._phase_start_dof_pos = self._current_leg_dof_pos(robot).clone()
-        self._stand_dof_pos = self._phase_start_dof_pos.clone()
-        self._squat_dof_pos = self._build_squat_dof_pos(
-            self._phase_start_dof_pos.clone(),
-            self._leg_joint_names_in_robot,
-        )
+        current_leg_dof_pos = self._current_leg_dof_pos(robot).clone()
+        self._phase_start_dof_pos = current_leg_dof_pos.clone()
+        self._stand_dof_pos = current_leg_dof_pos.clone()
+        self._squat_dof_pos = current_leg_dof_pos.clone()
+        self._hold_dof_pos = current_leg_dof_pos.clone()
+        self._ik_target_dof_pos = current_leg_dof_pos.clone()
+        self._stand_root_height = robot.data.root_pos_w[:, 2].clone()
+        self._phase_start_root_height = self._stand_root_height.clone()
+        self._phase_goal_root_height = self._phase_start_root_height - self.crouch_drop_height
+        self._commanded_root_height = self._phase_start_root_height.clone()
+        self._phase_target_foot_pos_w = self._current_foot_pos_w(robot).clone()
         self._phase_start_step = self._get_episode_step_buf(robot).clone()
         self._last_alpha = torch.zeros(
             self._stand_dof_pos.shape[0], device=self._stand_dof_pos.device, dtype=self._stand_dof_pos.dtype
         )
+        self._last_desired_root_height = self._phase_start_root_height.clone()
         self.state = "CROUCHING"
 
     def start_stand_up(self, robot):
         self._ensure_initialized(robot)
         self._sync_episode_reset(robot)
         self._phase_start_dof_pos = self._current_leg_dof_pos(robot).clone()
+        self._hold_dof_pos = self._phase_start_dof_pos.clone()
+        self._phase_start_root_height = robot.data.root_pos_w[:, 2].clone()
+        if self._stand_root_height is None:
+            self._stand_root_height = self._phase_start_root_height + self.crouch_drop_height
+        self._phase_goal_root_height = self._stand_root_height.clone()
+        self._phase_target_foot_pos_w = self._current_foot_pos_w(robot).clone()
         self._phase_start_step = self._get_episode_step_buf(robot).clone()
         self._last_alpha = torch.zeros(
             self._phase_start_dof_pos.shape[0], device=self._phase_start_dof_pos.device, dtype=self._phase_start_dof_pos.dtype
         )
+        self._last_desired_root_height = self._phase_start_root_height.clone()
         self.state = "STANDING_UP"
 
     def step(self, robot, sim_dt: float) -> tuple[bool, torch.Tensor | None]:
@@ -1031,29 +1402,69 @@ class LegPostureController:
         self._sync_episode_reset(robot)
 
         if self.state == "CROUCHING":
-            target_dof_pos, alpha = self._interpolate_to_target(
+            # 调用统一的高度计算函数，包含姿态保护
+            desired_root_height, debug_info = self._compute_crouch_desired_root_height(robot)
+
+            unstable = debug_info.get("unstable")
+            actual_dof_pos = self._current_leg_dof_pos(robot).clone()
+            if unstable is not None and torch.any(unstable):
+                if self._ik_target_dof_pos is None:
+                    self._ik_target_dof_pos = actual_dof_pos.clone()
+                self._ik_target_dof_pos = torch.where(
+                    unstable.unsqueeze(1),
+                    actual_dof_pos,
+                    self._ik_target_dof_pos,
+                )
+
+            target_dof_pos, alpha = self._solve_leg_targets_for_height(
                 robot=robot,
-                start_dof_pos=self._phase_start_dof_pos,
-                goal_dof_pos=self._squat_dof_pos,
-                duration=self.crouch_duration,
+                desired_root_height=desired_root_height,
+                unstable_mask=unstable,
             )
-            done = bool(torch.all(alpha >= 0.999))
-            if done:
-                dof_error = torch.max(torch.abs(self._current_leg_dof_pos(robot) - self._squat_dof_pos), dim=1).values
-                done = bool(torch.all(dof_error <= self.joint_error_tol))
+            # 加入 IK anti-windup 的 debug 信息
+            debug_info["max_abs_tracking_error"] = self._last_max_abs_tracking_error
+            debug_info["max_abs_target_error"] = self._last_max_abs_target_error
+            self._log_debug(robot, debug_info)
+
+            pose_done = self._pose_reached(robot, self._phase_goal_root_height)
+            done = pose_done
             if done:
                 self.state = "HOLDING_CROUCH"
+                self._hold_dof_pos = target_dof_pos.clone()
+                self._squat_dof_pos = target_dof_pos.clone()
             return done, target_dof_pos
 
-        if self.state == "STANDING_UP":
-            target_dof_pos, alpha = self._interpolate_to_target(
+        if self.state == "HOLDING_CROUCH":
+            target_dof_pos, _ = self._solve_leg_targets_for_height(
                 robot=robot,
-                start_dof_pos=self._phase_start_dof_pos,
-                goal_dof_pos=self._stand_dof_pos,
-                duration=self.stand_up_duration,
+                desired_root_height=self._phase_goal_root_height,
             )
-            done = bool(torch.all(alpha >= 0.999))
+            self._hold_dof_pos = target_dof_pos.clone()
+            self._squat_dof_pos = target_dof_pos.clone()
+            self._log_debug(
+                robot,
+                self._collect_debug_info(
+                    robot=robot,
+                    desired_root_height=self._phase_goal_root_height,
+                    unstable=torch.zeros_like(robot.data.root_pos_w[:, 2], dtype=torch.bool),
+                    paused=torch.zeros_like(robot.data.root_pos_w[:, 2], dtype=torch.bool),
+                    state_override="HOLDING_CROUCH",
+                    max_abs_tracking_error=self._last_max_abs_tracking_error,
+                    max_abs_target_error=self._last_max_abs_target_error,
+                ),
+            )
+            return False, target_dof_pos
+
+        if self.state == "STANDING_UP":
+            target_dof_pos, alpha = self._solve_leg_targets_for_height(
+                robot=robot,
+                desired_root_height=self._phase_interp_root_height(robot, self.stand_up_duration),
+            )
+            elapsed_done = bool(torch.all(alpha >= 0.999))
+            pose_done = self._pose_reached(robot, self._phase_goal_root_height)
+            done = elapsed_done or pose_done
             if done:
+                self._hold_dof_pos = self._stand_dof_pos.clone()
                 self.state = "IDLE"
             return done, target_dof_pos
 
@@ -1062,7 +1473,7 @@ class LegPostureController:
 
     def hold_current_target(self) -> torch.Tensor | None:
         if self.state == "HOLDING_CROUCH":
-            return None if self._squat_dof_pos is None else self._squat_dof_pos.clone()
+            return None if self._hold_dof_pos is None else self._hold_dof_pos.clone()
         if self.state == "STANDING_UP":
             return None if self._stand_dof_pos is None else self._stand_dof_pos.clone()
         return None
@@ -1087,18 +1498,58 @@ class LegPostureController:
             return
         self._leg_joint_ids, self._leg_joint_names_in_robot = robot.find_joints(self.leg_joint_names)
         self._leg_joint_names_in_robot = list(self._leg_joint_names_in_robot)
+        leg_name_to_local_idx = {name: idx for idx, name in enumerate(self._leg_joint_names_in_robot)}
+        self._leg_groups = []
+        self._foot_body_ids = []
+        for foot_name in self.foot_body_names:
+            leg_prefix = foot_name.split("_", 1)[0]
+            joint_names = [f"{leg_prefix}_hip_joint", f"{leg_prefix}_thigh_joint", f"{leg_prefix}_calf_joint"]
+            local_joint_ids = [leg_name_to_local_idx[name] for name in joint_names if name in leg_name_to_local_idx]
+            robot_joint_ids = [int(self._leg_joint_ids[idx]) for idx in local_joint_ids]
+            body_ids, body_names = robot.find_bodies(foot_name)
+            if len(body_ids) != 1:
+                raise ValueError(f"Expected exactly one foot body '{foot_name}', found {body_names}")
+            foot_body_id = int(body_ids[0])
+            if robot.is_fixed_base:
+                jacobi_body_idx = foot_body_id - 1
+                jacobi_joint_ids = robot_joint_ids
+            else:
+                jacobi_body_idx = foot_body_id
+                jacobi_joint_ids = [joint_id + 6 for joint_id in robot_joint_ids]
+            self._foot_body_ids.append(foot_body_id)
+            self._leg_groups.append(
+                {
+                    "prefix": leg_prefix,
+                    "local_joint_ids": local_joint_ids,
+                    "jacobi_body_idx": jacobi_body_idx,
+                    "jacobi_joint_ids": jacobi_joint_ids,
+                }
+            )
         current_leg_dof_pos = self._current_leg_dof_pos(robot).clone()
         self._stand_dof_pos = current_leg_dof_pos.clone()
-        self._squat_dof_pos = self._build_squat_dof_pos(
-            current_leg_dof_pos.clone(),
-            self._leg_joint_names_in_robot,
-        )
+        self._squat_dof_pos = current_leg_dof_pos.clone()
+        self._hold_dof_pos = current_leg_dof_pos.clone()
         self._phase_start_dof_pos = current_leg_dof_pos.clone()
+        self._stand_root_height = robot.data.root_pos_w[:, 2].clone()
+        self._phase_start_root_height = self._stand_root_height.clone()
+        self._phase_goal_root_height = self._stand_root_height.clone()
+        self._phase_target_foot_pos_w = self._current_foot_pos_w(robot).clone()
         self._phase_start_step = self._get_episode_step_buf(robot).clone()
         self._last_episode_length_buf = self._get_episode_step_buf(robot).clone()
         self._last_alpha = torch.zeros(
             current_leg_dof_pos.shape[0], device=current_leg_dof_pos.device, dtype=current_leg_dof_pos.dtype
         )
+        self._last_desired_root_height = self._stand_root_height.clone()
+        zeros_like_height = torch.zeros_like(self._stand_root_height)
+        false_like_height = torch.zeros_like(self._stand_root_height, dtype=torch.bool)
+        self._last_height_error = zeros_like_height.clone()
+        self._last_max_foot_error = zeros_like_height.clone()
+        self._last_roll = zeros_like_height.clone()
+        self._last_pitch = zeros_like_height.clone()
+        self._last_unstable = false_like_height.clone()
+        self._last_paused = false_like_height.clone()
+        self._last_leg_delta_pre_clamp = zeros_like_height.clone()
+        self._last_leg_delta_post_clamp = zeros_like_height.clone()
         self._initialized = True
 
     def _get_episode_step_buf(self, robot) -> torch.Tensor:
@@ -1117,51 +1568,305 @@ class LegPostureController:
             current_leg_dof_pos = self._current_leg_dof_pos(robot)
             self._stand_dof_pos[env_ids] = current_leg_dof_pos[env_ids].clone()
             self._phase_start_dof_pos[env_ids] = current_leg_dof_pos[env_ids].clone()
+            self._squat_dof_pos[env_ids] = current_leg_dof_pos[env_ids].clone()
+            self._hold_dof_pos[env_ids] = current_leg_dof_pos[env_ids].clone()
+            if self._ik_target_dof_pos is None:
+                self._ik_target_dof_pos = self._current_leg_dof_pos(robot).clone()
+            self._ik_target_dof_pos[env_ids] = current_leg_dof_pos[env_ids].clone()
+            current_root_height = robot.data.root_pos_w[:, 2]
+            self._stand_root_height[env_ids] = current_root_height[env_ids].clone()
+            self._phase_start_root_height[env_ids] = current_root_height[env_ids].clone()
+            self._phase_goal_root_height[env_ids] = current_root_height[env_ids].clone()
+            if self._commanded_root_height is None:
+                self._commanded_root_height = current_root_height.clone()
+            self._commanded_root_height[env_ids] = current_root_height[env_ids].clone()
+            self._phase_target_foot_pos_w[env_ids] = self._current_foot_pos_w(robot)[env_ids].clone()
             self._phase_start_step[env_ids] = step_buf[env_ids].clone()
             self._last_alpha[env_ids] = 0.0
+            self._last_desired_root_height[env_ids] = current_root_height[env_ids].clone()
             self.state = "IDLE"
         self._last_episode_length_buf = step_buf
 
     def _current_leg_dof_pos(self, robot) -> torch.Tensor:
         return robot.data.joint_pos[:, self._leg_joint_ids]
 
-    def _build_squat_dof_pos(self, reference: torch.Tensor, leg_joint_names: list[str]) -> torch.Tensor:
-        squat_dof_pos = reference.clone()
-        leg_offsets = {
-            "FR": {"hip": 0.15, "thigh": self.front_crouch_thigh, "calf": self.front_crouch_calf},
-            "FL": {"hip": -0.15, "thigh": self.front_crouch_thigh, "calf": self.front_crouch_calf},
-            "RR": {"hip": 0.1, "thigh": self.rear_crouch_thigh, "calf": self.rear_crouch_calf},
-            "RL": {"hip": -0.1, "thigh": self.rear_crouch_thigh, "calf": self.rear_crouch_calf},
-        }
-        for joint_idx, joint_name in enumerate(leg_joint_names):
-            for leg_key, leg_offset in leg_offsets.items():
-                if leg_key not in joint_name:
-                    continue
-                if "hip" in joint_name:
-                    squat_dof_pos[:, joint_idx] = reference[:, joint_idx] + leg_offset["hip"]
-                elif "thigh" in joint_name:
-                    squat_dof_pos[:, joint_idx] = reference[:, joint_idx] + leg_offset["thigh"]
-                elif "calf" in joint_name:
-                    squat_dof_pos[:, joint_idx] = reference[:, joint_idx] + leg_offset["calf"]
-                break
-        return squat_dof_pos
+    def _current_foot_pos_w(self, robot) -> torch.Tensor:
+        return robot.data.body_pos_w[:, self._foot_body_ids, :3]
 
-    def _interpolate_to_target(
-        self,
-        robot,
-        start_dof_pos: torch.Tensor,
-        goal_dof_pos: torch.Tensor,
-        duration: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def _phase_interp_root_height(self, robot, duration: float) -> torch.Tensor:
         step_buf = self._get_episode_step_buf(robot).to(dtype=torch.float32)
         phase_start_step = self._phase_start_step.to(dtype=torch.float32)
         step_dt = float(getattr(getattr(robot, "_env", None), "step_dt", 0.02))
         t = (step_buf - phase_start_step) * step_dt
         alpha = torch.clamp(t / max(duration, 1.0e-6), 0.0, 1.0)
-        alpha = alpha * alpha * (3.0 - 2.0 * alpha)
         self._last_alpha = alpha.clone()
-        alpha = alpha.unsqueeze(1)
-        return (1.0 - alpha) * start_dof_pos + alpha * goal_dof_pos, self._last_alpha
+        smooth_alpha = 0.5 - 0.5 * torch.cos(alpha * math.pi)
+        return self._phase_start_root_height + (self._phase_goal_root_height - self._phase_start_root_height) * smooth_alpha
+
+    def _get_base_rpy_height(self, robot) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        quat = robot.data.root_quat_w
+        w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+        sinr_cosp = 2.0 * (w * x + y * z)
+        cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+        roll = torch.atan2(sinr_cosp, cosr_cosp)
+        sinp = 2.0 * (w * y - z * x)
+        pitch = torch.asin(torch.clamp(sinp, -1.0, 1.0))
+        height = robot.data.root_pos_w[:, 2]
+        return roll, pitch, height
+
+    def _get_pose_errors(self, robot, desired_root_height: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        current_height = robot.data.root_pos_w[:, 2]
+        height_error = torch.abs(current_height - desired_root_height)
+        foot_error = torch.linalg.norm(
+            self._current_foot_pos_w(robot) - self._phase_target_foot_pos_w,
+            dim=-1,
+        ).max(dim=1).values
+        return height_error, foot_error
+
+    def _pose_reached(self, robot, desired_root_height: torch.Tensor) -> bool:
+        roll, pitch, _ = self._get_base_rpy_height(robot)
+        height_error, foot_error = self._get_pose_errors(robot, desired_root_height)
+        stable_rp = (torch.abs(roll) <= self.max_rp) & (torch.abs(pitch) <= self.max_rp)
+        # Temporarily relax foot error check for testing
+        return bool(
+            torch.all(height_error <= self.body_height_tol)
+            # and torch.all(foot_error <= self.foot_pos_tol)  # Disable foot error check temporarily
+            and torch.all(stable_rp)
+        )
+
+    def _compute_crouch_desired_root_height(self, robot) -> tuple[torch.Tensor, dict[str, torch.Tensor | bool]]:
+        desired_by_time = self._phase_interp_root_height(robot, self.crouch_duration)
+        roll, pitch, current_height = self._get_base_rpy_height(robot)
+        goal_height = self._phase_goal_root_height.to(device=current_height.device, dtype=current_height.dtype)
+        start_height = self._phase_start_root_height.to(device=current_height.device, dtype=current_height.dtype)
+        _, foot_error = self._get_pose_errors(robot, goal_height)
+
+        # Disable unstable protection for testing
+        # unstable_rp = (torch.abs(roll) > self.max_rp) | (torch.abs(pitch) > self.max_rp)
+        # paused_foot = foot_error > self.foot_error_pause_thresh
+        # unstable = unstable_rp | paused_foot
+        unstable = torch.tensor([False], device=roll.device)  # Force disable
+        paused = unstable.clone()
+
+        # 闭环限速下降：每步最多只比当前实际高度低 max_height_step，
+        # 同时绝不允许期望高度高于当前实际高度，避免上下打架。
+        step_limited_height = torch.maximum(
+            current_height - self.max_height_step,
+            goal_height,
+        )
+        desired_root_height = torch.maximum(
+            step_limited_height,
+            desired_by_time.to(device=current_height.device, dtype=current_height.dtype),
+        )
+        desired_root_height = torch.minimum(desired_root_height, current_height)
+        desired_root_height = torch.where(
+            unstable,
+            current_height,
+            desired_root_height,
+        )
+        self._commanded_root_height = desired_root_height.clone()
+
+        # 更新 alpha：进度 = (start_height - desired_height) / crouch_drop_height
+        drop = self.crouch_drop_height
+        if drop < 1.0e-4:
+            alpha = torch.zeros_like(current_height)
+        else:
+            alpha = torch.clamp(
+                (start_height - desired_root_height) / drop,
+                0.0,
+                1.0
+            )
+        self._last_alpha = alpha.clone()
+
+        self._last_desired_root_height = desired_root_height.clone()
+        debug_info = self._collect_debug_info(
+            robot=robot,
+            desired_root_height=desired_root_height,
+            unstable=unstable,
+            paused=paused,
+        )
+        return desired_root_height, debug_info
+
+    def _collect_debug_info(
+        self,
+        robot,
+        desired_root_height: torch.Tensor,
+        unstable: torch.Tensor,
+        paused: torch.Tensor,
+        state_override: str | None = None,
+        max_abs_tracking_error: torch.Tensor | None = None,
+        max_abs_target_error: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor | bool]:
+        roll, pitch, current_height = self._get_base_rpy_height(robot)
+        goal_height = self._phase_goal_root_height.to(device=current_height.device, dtype=current_height.dtype)
+        height_error, foot_error = self._get_pose_errors(robot, goal_height)
+        self._last_height_error = height_error.clone()
+        self._last_max_foot_error = foot_error.clone()
+        self._last_roll = roll.clone()
+        self._last_pitch = pitch.clone()
+        self._last_unstable = unstable.clone()
+        self._last_paused = paused.clone()
+        if max_abs_tracking_error is not None:
+            self._last_max_abs_tracking_error = max_abs_tracking_error.clone()
+        if max_abs_target_error is not None:
+            self._last_max_abs_target_error = max_abs_target_error.clone()
+        return {
+            "state": state_override or self.state,
+            "alpha": None if self._last_alpha is None else self._last_alpha.clone(),
+            "current_height": current_height.clone(),
+            "desired_root_height": desired_root_height.clone(),
+            "goal_height": goal_height.clone(),
+            "height_error": height_error.clone(),
+            "roll": roll.clone(),
+            "pitch": pitch.clone(),
+            "max_foot_error": foot_error.clone(),
+            "unstable": unstable.clone(),
+            "paused": paused.clone(),
+            "max_abs_tracking_error": max_abs_tracking_error,
+            "max_abs_target_error": max_abs_target_error,
+        }
+
+    def _log_debug(self, robot, debug_info: dict[str, torch.Tensor | bool]):
+        step_buf = self._get_episode_step_buf(robot)
+        if step_buf.numel() == 0 or int(step_buf[0].item()) % self.debug_interval != 0:
+            return
+        alpha = debug_info.get("alpha")
+        alpha_str = None if alpha is None else alpha.detach().cpu().tolist()
+        trk = debug_info.get("max_abs_tracking_error")
+        trk_str = None if trk is None else trk.detach().cpu().tolist()
+        tgt = debug_info.get("max_abs_target_error")
+        tgt_str = None if tgt is None else tgt.detach().cpu().tolist()
+        # print(
+        #     f"[SQUAT-CTRL] state={debug_info['state']} "
+        #     f"alpha={alpha_str} "
+        #     f"current_height={debug_info['current_height'].detach().cpu().tolist()} "
+        #     f"desired_root_height={debug_info['desired_root_height'].detach().cpu().tolist()} "
+        #     f"goal_height={debug_info['goal_height'].detach().cpu().tolist()} "
+        #     f"height_error={debug_info['height_error'].detach().cpu().tolist()} "
+        #     f"roll={debug_info['roll'].detach().cpu().tolist()} "
+        #     f"pitch={debug_info['pitch'].detach().cpu().tolist()} "
+        #     f"max_foot_error={debug_info['max_foot_error'].detach().cpu().tolist()} "
+        #     f"max_abs_leg_delta_pre_clamp={None if self._last_leg_delta_pre_clamp is None else self._last_leg_delta_pre_clamp.detach().cpu().tolist()} "
+        #     f"max_abs_leg_delta_post_clamp={None if self._last_leg_delta_post_clamp is None else self._last_leg_delta_post_clamp.detach().cpu().tolist()} "
+        #     f"unstable={debug_info['unstable'].detach().cpu().tolist()} "
+        #     f"paused={debug_info['paused'].detach().cpu().tolist()} "
+        #     f"max_abs_tracking_error={trk_str} "
+        #     f"max_abs_target_error={tgt_str}",
+        #     flush=True,
+        # )
+
+    def _solve_leg_targets_for_height(
+        self,
+        robot,
+        desired_root_height: torch.Tensor,
+        unstable_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        from isaaclab.utils.math import matrix_from_quat, quat_inv, quat_rotate_inverse
+
+        actual_dof_pos = self._current_leg_dof_pos(robot).clone()
+        if unstable_mask is None:
+            unstable_mask = torch.zeros(actual_dof_pos.shape[0], device=actual_dof_pos.device, dtype=torch.bool)
+        else:
+            unstable_mask = unstable_mask.to(device=actual_dof_pos.device, dtype=torch.bool)
+
+        if self._ik_target_dof_pos is None or self._ik_target_dof_pos.shape != actual_dof_pos.shape:
+            self._ik_target_dof_pos = actual_dof_pos.clone()
+        self._ik_target_dof_pos = torch.where(
+            unstable_mask.unsqueeze(1),
+            actual_dof_pos,
+            self._ik_target_dof_pos,
+        )
+
+        # 1) Anti-windup: 如果 IK target 和实际关节差距太大，先拉回实际附近
+        tracking_delta = self._ik_target_dof_pos - actual_dof_pos
+        max_abs_tracking_error = torch.max(torch.abs(tracking_delta), dim=1).values
+        self._ik_target_dof_pos = torch.clamp(
+            self._ik_target_dof_pos,
+            actual_dof_pos - self.max_ik_tracking_error,
+            actual_dof_pos + self.max_ik_tracking_error,
+        )
+
+        # 2) 使用被限制后的 _ik_target_dof_pos 作为 IK 迭代起点
+        ik_base_dof_pos = self._ik_target_dof_pos.clone()
+
+        root_pos_w = robot.data.root_pos_w[:, :3]
+        root_quat_w = robot.data.root_quat_w
+        target_root_pos_w = root_pos_w.clone()
+        target_root_pos_w[:, 2] = desired_root_height
+
+        base_rot_mat = matrix_from_quat(quat_inv(root_quat_w))
+        jacobians = robot.root_physx_view.get_jacobians()
+        target_dof_pos = ik_base_dof_pos.clone()
+        identity = torch.eye(3, device=actual_dof_pos.device, dtype=actual_dof_pos.dtype).unsqueeze(0)
+        max_abs_leg_delta_pre_clamp = torch.zeros(
+            actual_dof_pos.shape[0], device=actual_dof_pos.device, dtype=actual_dof_pos.dtype
+        )
+        max_abs_leg_delta_post_clamp = torch.zeros_like(max_abs_leg_delta_pre_clamp)
+
+        for leg_idx, leg_group in enumerate(self._leg_groups):
+            local_joint_ids = leg_group["local_joint_ids"]
+            if len(local_joint_ids) != 3:
+                continue
+
+            foot_body_id = self._foot_body_ids[leg_idx]
+            current_foot_pos_w = robot.data.body_pos_w[:, foot_body_id, :3]
+            current_foot_pos_b = quat_rotate_inverse(root_quat_w, current_foot_pos_w - root_pos_w)
+            target_foot_pos_b = quat_rotate_inverse(
+                root_quat_w,
+                self._phase_target_foot_pos_w[:, leg_idx, :] - target_root_pos_w,
+            )
+            foot_pos_error_b = target_foot_pos_b - current_foot_pos_b
+
+            jacobian = jacobians[:, leg_group["jacobi_body_idx"], :3, leg_group["jacobi_joint_ids"]]
+            jacobian = torch.bmm(base_rot_mat, jacobian)
+            jj_t = torch.bmm(jacobian, jacobian.transpose(1, 2))
+            damping = (self.ik_damping ** 2) * identity
+            solve_rhs = foot_pos_error_b.unsqueeze(-1)
+            leg_delta = torch.bmm(
+                jacobian.transpose(1, 2),
+                torch.linalg.solve(jj_t + damping, solve_rhs),
+            ).squeeze(-1)
+            max_abs_leg_delta_pre_clamp = torch.maximum(
+                max_abs_leg_delta_pre_clamp,
+                torch.max(torch.abs(leg_delta), dim=1).values,
+            )
+            leg_delta_clamped = torch.clamp(leg_delta, -self.max_joint_step, self.max_joint_step)
+            max_abs_leg_delta_post_clamp = torch.maximum(
+                max_abs_leg_delta_post_clamp,
+                torch.max(torch.abs(leg_delta_clamped), dim=1).values,
+            )
+            target_dof_pos[:, local_joint_ids] = ik_base_dof_pos[:, local_joint_ids] + leg_delta_clamped
+
+        # 3) 全局 target 限制：目标关节角相对实际关节角的最大允许差值
+        target_delta = target_dof_pos - actual_dof_pos
+        max_abs_target_error = torch.max(torch.abs(target_delta), dim=1).values
+        target_dof_pos = torch.clamp(
+            target_dof_pos,
+            actual_dof_pos - self.max_ik_target_error,
+            actual_dof_pos + self.max_ik_target_error,
+        )
+        if torch.any(unstable_mask):
+            target_dof_pos = torch.where(
+                unstable_mask.unsqueeze(1),
+                actual_dof_pos,
+                target_dof_pos,
+            )
+            zeros_like_metric = torch.zeros_like(max_abs_leg_delta_pre_clamp)
+            max_abs_leg_delta_pre_clamp = torch.where(unstable_mask, zeros_like_metric, max_abs_leg_delta_pre_clamp)
+            max_abs_leg_delta_post_clamp = torch.where(unstable_mask, zeros_like_metric, max_abs_leg_delta_post_clamp)
+            max_abs_tracking_error = torch.where(unstable_mask, zeros_like_metric, max_abs_tracking_error)
+            max_abs_target_error = torch.where(unstable_mask, zeros_like_metric, max_abs_target_error)
+
+        self._last_leg_delta_pre_clamp = max_abs_leg_delta_pre_clamp
+        self._last_leg_delta_post_clamp = max_abs_leg_delta_post_clamp
+        self._last_max_abs_tracking_error = max_abs_tracking_error.clone()
+        self._last_max_abs_target_error = max_abs_target_error.clone()
+
+        # 4) 最后更新累积目标
+        self._ik_target_dof_pos = target_dof_pos.clone()
+        self._hold_dof_pos = target_dof_pos.clone()
+
+        return target_dof_pos, self._last_alpha
 
 
 class AlgSolution:
@@ -1234,13 +1939,13 @@ class AlgSolution:
         self.gripper_joint_names = list(B2_PIPER_ARM_JOINT_NAMES[6:])
         self._leg_posture_controller = LegPostureController(
             leg_joint_names=list(B2_PIPER_LEG_JOINT_NAMES),
-            front_crouch_thigh=float(os.getenv("ATEC_TASKB_FRONT_CROUCH_THIGH", "0.25")),
-            front_crouch_calf=float(os.getenv("ATEC_TASKB_FRONT_CROUCH_CALF", "-0.6")),
-            rear_crouch_thigh=float(os.getenv("ATEC_TASKB_REAR_CROUCH_THIGH", "0.3")),
-            rear_crouch_calf=float(os.getenv("ATEC_TASKB_REAR_CROUCH_CALF", "-0.7")),
-            crouch_duration=float(os.getenv("ATEC_TASKB_CROUCH_DURATION", "3.5")),
-            stand_up_duration=float(os.getenv("ATEC_TASKB_STAND_UP_DURATION", "3.5")),
-            joint_error_tol=float(os.getenv("ATEC_TASKB_CROUCH_JOINT_TOL", "0.12")),
+            crouch_drop_height=float(os.getenv("ATEC_TASKB_CROUCH_DROP_HEIGHT", "0.10")),
+            crouch_duration=float(os.getenv("ATEC_TASKB_CROUCH_DURATION", "2.0")),
+            stand_up_duration=float(os.getenv("ATEC_TASKB_STAND_UP_DURATION", "2.0")),
+            foot_pos_tol=float(os.getenv("ATEC_TASKB_CROUCH_FOOT_TOL", "0.1")),
+            body_height_tol=float(os.getenv("ATEC_TASKB_CROUCH_HEIGHT_TOL", "0.02")),
+            ik_damping=float(os.getenv("ATEC_TASKB_CROUCH_IK_DAMPING", "0.1")),
+            max_joint_step=float(os.getenv("ATEC_TASKB_CROUCH_MAX_JOINT_STEP", "0.08")),
         )
         self._pending_grasp_status = None
         self._wbc_grasp_phase = None
@@ -1249,24 +1954,30 @@ class AlgSolution:
         self._wbc_grasp_success = False
         self._wbc_grasp_timeout = 500
         self._wbc_last_action_18 = None
-        self._wbc_hold_ee_pos_w = None
-        self._wbc_hold_ee_quat_w = None
-        self._wbc_nav_initialized = False
+        self.sit_down_min_steps = max(1, int(os.getenv("ATEC_TASKB_SIT_DOWN_MIN_STEPS", "30")))
+        self.sit_down_stable_steps_required = max(1, int(os.getenv("ATEC_TASKB_SIT_DOWN_STABLE_STEPS", "15")))
+        self.sit_down_roll_pitch_thresh = float(os.getenv("ATEC_TASKB_SIT_DOWN_RP_THRESH", "0.18"))
+        self.sit_down_height_vel_thresh = float(os.getenv("ATEC_TASKB_SIT_DOWN_ZVEL_THRESH", "0.15"))
+        self.sit_down_ang_vel_thresh = float(os.getenv("ATEC_TASKB_SIT_DOWN_ANGVEL_THRESH", "0.4"))
+        self._sit_down_step_count = 0
+        self._sit_down_stable_count = 0
         
         # 加载预训练模型（用于腿部控制）
         self._load_actor_model()
         
-        # End-effector 摄像头配置
+        # 摄像头配置
         self._enable_ee_camera = os.getenv("ATEC_TASKB_ENABLE_EE_CAM", "1").lower() in {"1", "true", "yes", "on"}
-        self._ee_cam_save_interval = int(os.getenv("ATEC_TASKB_EE_CAM_SAVE_INTERVAL", "50"))  # 每50帧保存一次
+        self._camera_save_interval = max(1, int(os.getenv("ATEC_TASKB_CAMERA_SAVE_INTERVAL", "10")))  # 每10帧保存一次
         self._ee_cam_display = os.getenv("ATEC_TASKB_EE_CAM_DISPLAY", "1").lower() in {"1", "true", "yes", "on"}
-        
+
         # 创建图像保存目录
+        self._head_cam_save_dir = os.path.join(REPO_ROOT, "logs", "head_camera")
         self._ee_cam_save_dir = os.path.join(REPO_ROOT, "logs", "ee_camera")
+        os.makedirs(self._head_cam_save_dir, exist_ok=True)
         os.makedirs(self._ee_cam_save_dir, exist_ok=True)
-        
+
         # 摄像头状态
-        self._last_ee_cam_save_time = time.time()
+        self._head_cam_frame_count = 0
         self._ee_cam_frame_count = 0
         self._camera_debug_interval = 5
         self._camera_debug_enabled = True
@@ -1280,8 +1991,9 @@ class AlgSolution:
         print(f"[GT-NAV] Angular vel range: {self.ang_vel_range}")
         print(f"[GT-NAV] Device: {self.device_str}")
         print(f"[GT-NAV] EE Camera: {'enabled' if self._enable_ee_camera else 'disabled'}")
-        print(f"[GT-NAV] EE Camera Save Interval: {self._ee_cam_save_interval} frames")
+        print(f"[GT-NAV] Camera Save Interval: {self._camera_save_interval} frames")
         print(f"[GT-NAV] EE Camera Display: {'enabled' if self._ee_cam_display else 'disabled'}")
+        print(f"[GT-NAV] Head Camera Save Dir: {self._head_cam_save_dir}")
         print(f"[GT-NAV] EE Camera Save Dir: {self._ee_cam_save_dir}")
 
     def _load_actor_model(self):
@@ -1331,17 +2043,17 @@ class AlgSolution:
             }
             
             # 机械臂默认位置
-            b2_piper_arm_defaults = {
+            self.b2_piper_arm_defaults = {
                 "arm_joint1": 0.0,
-                "arm_joint2": 2.13,
+                "arm_joint2": 3.14, #2.13
                 "arm_joint3": -1.20,
                 "arm_joint4": 0.0,
-                "arm_joint5": 0.4,
+                "arm_joint5": -0.8,
                 "arm_joint6": 0.0,
                 "arm_joint7": 0.0,
                 "arm_joint8": 0.0,
             }
-            arm_default_pos = [b2_piper_arm_defaults.get(name, 0.0) for name in self.arm_joint_names]
+            arm_default_pos = [self.b2_piper_arm_defaults.get(name, 0.0) for name in self.arm_joint_names]
             self.arm_default_action = torch.tensor(
                 arm_default_pos,
                 device=self.device,
@@ -1354,7 +2066,37 @@ class AlgSolution:
             print(f"[GT-NAV] Failed to load actor model: {e}")
             self.actor = None
 
+        self._load_sit_down_actor_model()
         self._load_wbc_actor_model()
+
+    def _load_sit_down_actor_model(self):
+        """加载下蹲策略模型。"""
+        self.sit_down_checkpoint_path = os.path.join(REPO_ROOT, "demo", "sit_down.pt")
+        self.sit_down_actor = None
+        self.sit_down_actor_obs_dim = None
+
+        if not os.path.exists(self.sit_down_checkpoint_path):
+            print(f"[GT-NAV] Warning: sit-down checkpoint not found: {self.sit_down_checkpoint_path}")
+            return
+
+        try:
+            checkpoint = torch.load(self.sit_down_checkpoint_path, map_location="cpu")
+            state_dict = checkpoint["model_state_dict"]
+            actor_input_dim = state_dict["actor.0.weight"].shape[1]
+            actor_output_dim = state_dict["actor.6.bias"].shape[0]
+            self.sit_down_actor = B2PiperActor(actor_input_dim, actor_output_dim).to(self.device)
+            actor_state = {key: value for key, value in state_dict.items() if key.startswith("actor.")}
+            self.sit_down_actor.load_state_dict(actor_state, strict=True)
+            self.sit_down_actor.eval()
+            self.sit_down_actor_obs_dim = actor_input_dim
+            print(
+                f"[GT-NAV] Sit-down actor loaded: input={actor_input_dim}, output={actor_output_dim}",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"[GT-NAV] Failed to load sit-down actor model: {e}", flush=True)
+            self.sit_down_actor = None
+            self.sit_down_actor_obs_dim = None
 
     def _load_wbc_actor_model(self):
         """加载 WBC 全身控制模型"""
@@ -1440,52 +2182,38 @@ class AlgSolution:
 
         return ee_pose_cmd
 
-    def _get_current_gripper_pose_w(self):
-        """读取当前 gripper_base 世界位姿。"""
-        robot = self._get_robot()
+    def _get_arm_base_offset_b(self, robot) -> np.ndarray | None:
+        """返回 arm_base 相对 root 的基座坐标系偏移。"""
         if robot is None:
-            return None, None
+            return None
         try:
-            body_ids, _ = robot.find_bodies("gripper_base")
-            if len(body_ids) == 0:
-                return None, None
-            body_id = body_ids[0]
-            pos_w = robot.data.body_pos_w[0, body_id].detach().cpu().numpy().astype(np.float32)
-            quat_w = robot.data.body_quat_w[0, body_id].detach().cpu().numpy().astype(np.float32)
-            return pos_w, quat_w
-        except Exception:
-            return None, None
-
-    def _capture_wbc_hold_ee_pose(self, force: bool = False) -> bool:
-        """锁定导航阶段使用的末端保持位姿。"""
-        if not force and self._wbc_hold_ee_pos_w is not None and self._wbc_hold_ee_quat_w is not None:
-            return True
-        pos_w, quat_w = self._get_current_gripper_pose_w()
-        if pos_w is None or quat_w is None:
-            return False
-        self._wbc_hold_ee_pos_w = np.asarray(pos_w, dtype=np.float32).copy()
-        self._wbc_hold_ee_quat_w = np.asarray(quat_w, dtype=np.float32).copy()
-        return True
-
-    def _get_wbc_hold_ee_pose_cmd(self):
-        """返回导航阶段保持末端静止的 WBC 命令。"""
-        if self._wbc_hold_ee_pos_w is None or self._wbc_hold_ee_quat_w is None:
-            if not self._capture_wbc_hold_ee_pose(force=False):
+            arm_base_body_ids, _ = robot.find_bodies("arm_base")
+            if len(arm_base_body_ids) == 0:
                 return None
-        return self._compute_ee_pose_cmd(self._wbc_hold_ee_pos_w, self._wbc_hold_ee_quat_w)
+            body_id = arm_base_body_ids[0]
+            root_pos_w = robot.data.root_pos_w[0, :3]
+            root_quat_w = robot.data.root_quat_w[0].unsqueeze(0)
+            arm_base_pos_w = robot.data.body_pos_w[0, body_id, :3]
+            from isaaclab.utils.math import quat_rotate_inverse as _quat_rotate_inverse
 
-    def _ensure_wbc_nav_session(self, obs, base_cmd):
-        """初始化全程 WBC 导航会话，复用同一套历史。"""
-        if self.wbc_actor is None:
-            return
-        if self._wbc_nav_initialized:
-            return
-        if not self._capture_wbc_hold_ee_pose(force=False):
-            return
-        self._wbc_last_action_18 = torch.zeros(1, 18, device=self.device, dtype=torch.float32)
-        ee_pose_cmd = self._get_wbc_hold_ee_pose_cmd()
-        self._reset_wbc_history(obs, base_cmd, ee_pose_cmd)
-        self._wbc_nav_initialized = True
+            delta_pos_w = (arm_base_pos_w - root_pos_w).unsqueeze(0)
+            offset_b = _quat_rotate_inverse(root_quat_w, delta_pos_w).squeeze(0)
+            return offset_b.detach().cpu().numpy().astype(np.float32)
+        except Exception:
+            return None
+
+    def _get_arm_base_pos_w(self, robot) -> np.ndarray | None:
+        """返回 arm_base 在世界坐标系下的位置。"""
+        if robot is None:
+            return None
+        try:
+            arm_base_body_ids, _ = robot.find_bodies("arm_base")
+            if len(arm_base_body_ids) == 0:
+                return None
+            arm_base_pos_w = robot.data.body_pos_w[0, arm_base_body_ids[0], :3]
+            return arm_base_pos_w.detach().cpu().numpy().astype(np.float32)
+        except Exception:
+            return None
 
     def _extract_wbc_single_obs(self, obs, base_cmd, ee_pose_cmd=None):
         """提取 WBC policy 单步观测 (70维)
@@ -1585,18 +2313,7 @@ class AlgSolution:
                     "clip": [-300.0, 300.0],
                 }
             }
-        return {
-            "leg": {
-                "mode": "position",
-                "scale": 0.25,
-                "clip": None,
-            },
-            "arm": {
-                "mode": "position",
-                "scale": 0.25,
-                "clip": None,
-            },
-        }
+        return None
 
     def _warn_once(self, key: str, message: str):
         """避免重复打印相同 warning。"""
@@ -1674,12 +2391,12 @@ class AlgSolution:
         self._leg_control_initialized = True
 
         if not self._printed_leg_control_info:
-            print(f"[SQUAT] dof_names={self._leg_joint_names_in_robot}", flush=True)
-            print(
-                f"[SQUAT] squat_dof_pos={self._leg_posture_controller.get_squat_dof_pos()[0].detach().cpu().tolist()}",
-                flush=True,
-            )
-            print(f"[SQUAT] env_leg_order={self.leg_joint_names}", flush=True)
+            # Comment out IK squat debug prints for cleaner output (using sit_down.pt)
+            # print(f"[SQUAT] dof_names={self._leg_joint_names_in_robot}", flush=True)
+            # squat_dof_pos = self._leg_posture_controller.get_squat_dof_pos()
+            # if squat_dof_pos is not None:
+            #     print(f"[SQUAT] squat_dof_pos={squat_dof_pos[0].detach().cpu().tolist()}", flush=True)
+            # print(f"[SQUAT] env_leg_order={self.leg_joint_names}", flush=True)
             self._printed_leg_control_info = True
 
     def _reorder_env_leg_to_robot(self, tensor_env_order: torch.Tensor) -> torch.Tensor:
@@ -1751,19 +2468,19 @@ class AlgSolution:
         torques = self._leg_p_gains * (target_dof_pos - dof_pos) - self._leg_d_gains * dof_vel
         torques = torch.clip(torques, -self._leg_torque_limits, self._leg_torque_limits)
 
-        if self._step_count % self.control_cfg.debug_interval == 0:
-            alpha = self._leg_posture_controller.get_alpha()
-            roll, pitch, height = self._get_base_rpy_height(robot)
-            print(
-                f"[SQUAT] alpha={None if alpha is None else alpha.detach().cpu().tolist()} "
-                f"target_dof_pos={target_dof_pos[0].detach().cpu().tolist()} "
-                f"dof_pos={dof_pos[0].detach().cpu().tolist()} "
-                f"torque_max={float(torch.max(torch.abs(torques)).item()):.3f} "
-                f"roll={float(roll[0].item()):.3f} "
-                f"pitch={float(pitch[0].item()):.3f} "
-                f"height={float(height[0].item()):.3f}",
-                flush=True,
-            )
+        # if self._step_count % self.control_cfg.debug_interval == 0:
+        #     alpha = self._leg_posture_controller.get_alpha()
+        #     roll, pitch, height = self._get_base_rpy_height(robot)
+        #     print(
+        #         f"[SQUAT] alpha={None if alpha is None else alpha.detach().cpu().tolist()} "
+        #         f"target_dof_pos={target_dof_pos[0].detach().cpu().tolist()} "
+        #         f"dof_pos={dof_pos[0].detach().cpu().tolist()} "
+        #         f"torque_max={float(torch.max(torch.abs(torques)).item()):.3f} "
+        #         f"roll={float(roll[0].item()):.3f} "
+        #         f"pitch={float(pitch[0].item()):.3f} "
+        #         f"height={float(height[0].item()):.3f}",
+        #         flush=True,
+        #     )
         return torques
 
     def _compute_leg_position_actions(self, target_dof_pos: torch.Tensor, robot) -> torch.Tensor:
@@ -1785,18 +2502,18 @@ class AlgSolution:
             self._last_leg_action_override = leg_actions.clone()
 
         dof_pos = current_dof_pos
-        if self._step_count % self.control_cfg.debug_interval == 0:
-            alpha = self._leg_posture_controller.get_alpha()
-            roll, pitch, height = self._get_base_rpy_height(robot)
-            print(
-                f"[SQUAT] alpha={None if alpha is None else alpha.detach().cpu().tolist()} "
-                f"target_dof_pos={target_dof_pos[0].detach().cpu().tolist()} "
-                f"dof_pos={dof_pos[0].detach().cpu().tolist()} "
-                f"roll={float(roll[0].item()):.3f} "
-                f"pitch={float(pitch[0].item()):.3f} "
-                f"height={float(height[0].item()):.3f}",
-                flush=True,
-            )
+        # if self._step_count % self.control_cfg.debug_interval == 0:
+        #     alpha = self._leg_posture_controller.get_alpha()
+        #     roll, pitch, height = self._get_base_rpy_height(robot)
+        #     print(
+        #         f"[SQUAT] alpha={None if alpha is None else alpha.detach().cpu().tolist()} "
+        #         f"target_dof_pos={target_dof_pos[0].detach().cpu().tolist()} "
+        #         f"dof_pos={dof_pos[0].detach().cpu().tolist()} "
+        #         f"roll={float(roll[0].item()):.3f} "
+        #         f"pitch={float(pitch[0].item()):.3f} "
+        #         f"height={float(height[0].item()):.3f}",
+        #         flush=True,
+        #     )
         return leg_actions
 
     def _generate_control_action_tensor(self, obs, base_cmd, robot) -> torch.Tensor:
@@ -1805,8 +2522,6 @@ class AlgSolution:
 
         if self.control_cfg.use_squat_test:
             target_dof_pos = self._get_squat_target_dof_pos(robot)
-        elif self._leg_posture_controller.hold_current_target() is not None:
-            target_dof_pos = self._leg_posture_controller.hold_current_target().to(device=self.device, dtype=torch.float32)
         elif self._leg_posture_controller.state != "IDLE":
             _, target_dof_pos = self._leg_posture_controller.step(robot, self.dt)
             if target_dof_pos is None:
@@ -1910,14 +2625,47 @@ class AlgSolution:
         )
         return None
 
-    def _process_ee_camera(self, obs):
-        """
-        处理相机调试显示：head RGB、head depth、ee depth
-        """
-        if not self._camera_debug_enabled:
+    def _save_camera_rgb_frame(self, rgb_frame, camera_name: str, save_dir: str):
+        """按固定步长保存 RGB 图像。"""
+        if rgb_frame is None:
             return
 
-        if self._step_count % self._camera_debug_interval != 0:
+        if self._step_count % self._camera_save_interval != 0:
+            return
+
+        try:
+            bgr_image = rgb_to_bgr_uint8(rgb_frame)
+            file_path = os.path.join(save_dir, f"{camera_name}_{self._step_count:06d}.png")
+            if cv2 is not None:
+                success = cv2.imwrite(file_path, bgr_image)
+                if not success:
+                    self._warn_once(
+                        f"camera_save_failed_{camera_name}",
+                        f"[GT-NAV] Warning: failed to save {camera_name} frame to {file_path}",
+                    )
+                    return
+            else:
+                self._warn_once(
+                    f"camera_save_cv2_missing_{camera_name}",
+                    f"[GT-NAV] Warning: OpenCV unavailable, cannot save {camera_name} frames.",
+                )
+                return
+
+            if camera_name == "head_camera":
+                self._head_cam_frame_count += 1
+            elif camera_name == "ee_camera":
+                self._ee_cam_frame_count += 1
+        except Exception as e:
+            self._warn_once(
+                f"camera_save_runtime_error_{camera_name}",
+                f"[GT-NAV] Warning: failed to save {camera_name} frame due to error: {e}",
+            )
+
+    def _process_ee_camera(self, obs):
+        """
+        处理相机调试显示，并按固定间隔保存 head/ee RGB 图像。
+        """
+        if not self._enable_ee_camera:
             return
 
         if cv2 is None:
@@ -1935,16 +2683,19 @@ class AlgSolution:
             ee_rgb = self._get_camera_output(ee_camera, "ee_camera", "rgb") if ee_camera is not None else None
             ee_depth = self._get_camera_depth_output(ee_camera, "ee_camera") if ee_camera is not None else None
 
-            
-            if head_rgb is not None:
-                cv2.imshow("head_rgb", rgb_to_bgr_uint8(head_rgb))
-            # if head_depth is not None:
-            #     cv2.imshow("head_depth", depth_to_colormap(head_depth))
-            if ee_rgb is not None:
-                cv2.imshow("ee_rgb", rgb_to_bgr_uint8(ee_rgb))
-            # if ee_depth is not None:
-            #     cv2.imshow("ee_depth", depth_to_colormap(ee_depth))
-            cv2.waitKey(1)
+            self._save_camera_rgb_frame(head_rgb, "head_camera", self._head_cam_save_dir)
+            self._save_camera_rgb_frame(ee_rgb, "ee_camera", self._ee_cam_save_dir)
+
+            if self._camera_debug_enabled and self._step_count % self._camera_debug_interval == 0:
+                if head_rgb is not None:
+                    cv2.imshow("head_rgb", rgb_to_bgr_uint8(head_rgb))
+                # if head_depth is not None:
+                #     cv2.imshow("head_depth", depth_to_colormap(head_depth))
+                if ee_rgb is not None:
+                    cv2.imshow("ee_rgb", rgb_to_bgr_uint8(ee_rgb))
+                # if ee_depth is not None:
+                #     cv2.imshow("ee_depth", depth_to_colormap(ee_depth))
+                cv2.waitKey(1)
         except Exception as e:
             self._warn_once("camera_debug_runtime_error", f"[GT-NAV] Warning: camera debug display disabled due to error: {e}")
             self._camera_debug_enabled = False
@@ -2223,8 +2974,8 @@ class AlgSolution:
             "target_class": target["class"]
         }
 
-    def _extract_policy_obs(self, obs: dict[str, Any], base_cmd: np.ndarray) -> torch.Tensor:
-        """提取策略观测（与 solution_rl.py 兼容）"""
+    def _extract_policy_obs(self, obs: dict[str, Any], base_cmd: np.ndarray, obs_dim: int | None = None) -> torch.Tensor:
+        """提取策略观测，兼容 walking policy(45) 和 sit-down policy(42)。"""
         proprio = torch.as_tensor(obs["proprio"], device=self.device, dtype=torch.float32)
         
         idx = 0
@@ -2253,21 +3004,25 @@ class AlgSolution:
         actions_leg_env = actions_all[:, :self.leg_action_dim]
         actions_leg_train = actions_leg_env * self.leg_action_scale_inv.to(dtype=proprio.dtype)
         
-        velocity_commands = torch.as_tensor(base_cmd, device=self.device, dtype=proprio.dtype).view(1, 3)
-        if proprio.shape[0] > 1:
-            velocity_commands = velocity_commands.repeat(proprio.shape[0], 1)
-        
-        policy_obs = torch.cat(
-            [
-                base_ang_vel * 0.25,
-                projected_gravity,
-                velocity_commands,
-                joint_pos_leg,
-                joint_vel_leg * 0.05,
-                actions_leg_train,
-            ],
-            dim=-1,
-        )
+        if obs_dim is None:
+            obs_dim = int(getattr(self.actor.actor[0], "in_features", 45)) if self.actor is not None else 45
+
+        components = [
+            base_ang_vel * 0.25,
+            projected_gravity,
+        ]
+        if obs_dim >= 45:
+            velocity_commands = torch.as_tensor(base_cmd, device=self.device, dtype=proprio.dtype).view(1, 3)
+            if proprio.shape[0] > 1:
+                velocity_commands = velocity_commands.repeat(proprio.shape[0], 1)
+            components.append(velocity_commands)
+        components.extend([
+            joint_pos_leg,
+            joint_vel_leg * 0.05,
+            actions_leg_train,
+        ])
+
+        policy_obs = torch.cat(components, dim=-1)
         return torch.nan_to_num(policy_obs, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _map_policy_action_to_env_action(self, action_train: torch.Tensor) -> torch.Tensor:
@@ -2281,15 +3036,17 @@ class AlgSolution:
         action_env[:, self.leg_action_dim:] = 0.0
         return torch.nan_to_num(action_env, nan=0.0, posinf=0.0, neginf=0.0)
 
-    def _generate_action_tensor(self, obs, base_cmd) -> torch.Tensor:
+    def _generate_action_tensor(self, obs, base_cmd, actor=None, obs_dim: int | None = None) -> torch.Tensor:
         """生成环境动作张量，便于叠加机械臂抓取目标。"""
-        if obs is None or self.actor is None:
+        if actor is None:
+            actor = self.actor
+        if obs is None or actor is None:
             return torch.zeros((1, self.total_action_dim), device=self.device, dtype=torch.float32)
 
         try:
-            policy_obs = self._extract_policy_obs(obs, base_cmd)
+            policy_obs = self._extract_policy_obs(obs, base_cmd, obs_dim=obs_dim)
             with torch.inference_mode():
-                action_train = self.actor(policy_obs)
+                action_train = actor(policy_obs)
 
             if action_train.ndim == 1:
                 action_train = action_train.unsqueeze(0)
@@ -2298,6 +3055,31 @@ class AlgSolution:
         except Exception as e:
             print(f"[GT-NAV] Actor inference error: {e}", flush=True)
             return torch.zeros((1, self.total_action_dim), device=self.device, dtype=torch.float32)
+
+    def _generate_sit_down_action_tensor(self, obs) -> torch.Tensor:
+        zero_cmd = np.zeros(3, dtype=np.float32)
+        return self._generate_action_tensor(
+            obs,
+            zero_cmd,
+            actor=self.sit_down_actor,
+            obs_dim=self.sit_down_actor_obs_dim,
+        )
+
+    def _reset_sit_down_tracking(self):
+        self._sit_down_step_count = 0
+        self._sit_down_stable_count = 0
+
+    def _is_sit_down_stable(self, robot) -> bool:
+        roll, pitch, _ = self._get_base_rpy_height(robot)
+        lin_vel_z = torch.abs(robot.data.root_lin_vel_b[:, 2])
+        ang_vel_xy = torch.linalg.norm(robot.data.root_ang_vel_b[:, :2], dim=1)
+        stable = (
+            (torch.abs(roll) <= self.sit_down_roll_pitch_thresh)
+            & (torch.abs(pitch) <= self.sit_down_roll_pitch_thresh)
+            & (lin_vel_z <= self.sit_down_height_vel_thresh)
+            & (ang_vel_xy <= self.sit_down_ang_vel_thresh)
+        )
+        return bool(torch.all(stable))
 
     def _action_tensor_to_output(self, action_env: torch.Tensor):
         return action_env.detach().cpu().numpy().tolist()
@@ -2354,10 +3136,12 @@ class AlgSolution:
             })
         
         # 使用 PolicyNavigator 计算 base_cmd（交给 policy 网络执行）
+        arm_base_offset_b = self._get_arm_base_offset_b(robot)
         base_cmd, nav_info = self._pregrasp_navigator.update(
             self.robot_pos, 
             self.robot_yaw, 
-            trash_targets
+            trash_targets,
+            arm_base_offset_b=arm_base_offset_b,
         )
         
         # 打印导航信息
@@ -2371,106 +3155,150 @@ class AlgSolution:
                 flush=True
             )
         
-        # 处理 READY_TO_GRASP 状态：到达后直接开始抓取，不蹲下，保持站立
+        # 处理 READY_TO_GRASP 状态：到达后先稳定下蹲，再开始抓取
         if nav_info["state"] == "READY_TO_GRASP":
             if self._pregrasp_navigator.current_target is not None:
                 target_xy = self._pregrasp_navigator.current_target["pos_w"][:2]
-                robot_xy = self.robot_pos[:2]
-                dist_to_target = np.linalg.norm(target_xy - robot_xy)
-                print(f"[GT-NAV] Safety check: dist_to_target={dist_to_target:.3f}m, stand_off={self._pregrasp_navigator.stand_off}m", flush=True)
+                arm_base_pos_w = self._get_arm_base_pos_w(robot)
+                if arm_base_pos_w is not None:
+                    reference_xy = arm_base_pos_w[:2]
+                    reference_name = "arm_base"
+                else:
+                    reference_xy = self.robot_pos[:2]
+                    reference_name = "root"
+                dist_to_target = np.linalg.norm(target_xy - reference_xy)
+                print(
+                    f"[GT-NAV] Safety check ({reference_name}): "
+                    f"dist_to_target={dist_to_target:.3f}m, "
+                    f"stand_off={self._pregrasp_navigator.stand_off}m",
+                    flush=True,
+                )
 
                 if dist_to_target > self._pregrasp_navigator.stand_off + 0.5:
-                    print(f"[GT-NAV] Warning: Too far from target! Resetting navigation...", flush=True)
+                    print(
+                        f"[GT-NAV] Warning: {reference_name} too far from target! Resetting navigation...",
+                        flush=True,
+                    )
                     self._pregrasp_navigator.nav_state = "SELECT_TARGET"
                 else:
+                    if robot is not None:
+                        self._leg_posture_controller.start_crouch(robot)
+                        self._reset_sit_down_tracking()
+                        self._pregrasp_navigator.nav_state = "CROUCHING"
+                        print(
+                            f"[GT-NAV] Started crouch before grasp for "
+                            f"{self._pregrasp_navigator.current_target['id']}",
+                            flush=True,
+                        )
+
+        if self._pregrasp_navigator.nav_state == "CROUCHING":
+            zero_cmd = np.zeros(3, dtype=np.float32)
+            if robot is None:
+                self._pregrasp_navigator.finish_current_target("failed")
+                return {"action": self._get_stand_still_action(obs), "giveup": False}
+            if self.sit_down_actor is not None:
+                action_env = self._generate_sit_down_action_tensor(obs)
+                self._sit_down_step_count += 1
+                if self._is_sit_down_stable(robot):
+                    self._sit_down_stable_count += 1
+                else:
+                    self._sit_down_stable_count = 0
+                crouch_ready = (
+                    self._sit_down_step_count >= self.sit_down_min_steps
+                    and self._sit_down_stable_count >= self.sit_down_stable_steps_required
+                )
+                if crouch_ready:
+                    self._leg_posture_controller.state = "HOLDING_CROUCH"
+            else:
+                action_env = self._generate_control_action_tensor(obs, zero_cmd, robot)
+                crouch_ready = self._leg_posture_controller.state == "HOLDING_CROUCH"
+            if crouch_ready:
+                if self._pregrasp_navigator.current_target is not None and arm_grasp_controller is not None:
                     trash_pos_w = self._pregrasp_navigator.current_target["pos_w"]
-                    self._wbc_grasp_trash_pos = np.asarray(trash_pos_w, dtype=np.float32).copy()
-                    self._wbc_grasp_phase = "pregrasp"
-                    self._wbc_grasp_step_count = 0
-                    self._wbc_grasp_success = False
-                    self._wbc_grasp_timeout = 500
+                    ee_quat_w = arm_grasp_controller.get_ee_pose()[1]
+                    arm_grasp_controller.start_grasp(
+                        self._pregrasp_navigator.current_target,
+                        trash_pos_w,
+                        current_ee_quat_w=ee_quat_w,
+                    )
                     self._pregrasp_navigator.nav_state = "GRASPING"
                     print(
-                        f"[GT-NAV] Started WBC grasp for "
+                        f"[GT-NAV] Crouch complete, started arm grasp for "
                         f"{self._pregrasp_navigator.current_target['id']}",
                         flush=True,
                     )
+                elif arm_grasp_controller is None:
+                    self._pending_grasp_status = "failed"
+                    self._reset_sit_down_tracking()
+                    self._leg_posture_controller.start_stand_up(robot)
+                    self._pregrasp_navigator.nav_state = "STAND_UP"
+                    print("[GT-NAV] Arm grasp controller unavailable after crouch, standing up.", flush=True)
+            return {"action": self._action_tensor_to_output(action_env), "giveup": False}
 
         if self._pregrasp_navigator.nav_state == "GRASPING":
             zero_cmd = np.zeros(3, dtype=np.float32)
 
-            if self.wbc_actor is None or robot is None:
+            if robot is None or arm_grasp_controller is None:
+                if robot is not None:
+                    self._pending_grasp_status = "failed"
+                    self._leg_posture_controller.start_stand_up(robot)
+                    self._pregrasp_navigator.nav_state = "STAND_UP"
+                    action_env = self._generate_control_action_tensor(obs, zero_cmd, robot)
+                    return {"action": self._action_tensor_to_output(action_env), "giveup": False}
                 self._pregrasp_navigator.finish_current_target("failed")
-                return {"action": self._action_tensor_to_output(self._generate_control_action_tensor(obs, zero_cmd, robot)), "giveup": False}
+                return {"action": self._get_stand_still_action(obs), "giveup": False}
 
-            self._wbc_grasp_step_count += 1
-            trash_pos = self._wbc_grasp_trash_pos
-
-            if self._wbc_grasp_phase == "pregrasp":
-                target_pos = trash_pos + np.array([0.0, 0.0, 0.20], dtype=np.float32)
-            elif self._wbc_grasp_phase == "grasp":
-                target_pos = trash_pos + np.array([0.0, 0.0, 0.03], dtype=np.float32)
-            elif self._wbc_grasp_phase == "lift":
-                target_pos = trash_pos + np.array([0.0, 0.0, 0.30], dtype=np.float32)
-            elif self._wbc_grasp_phase == "done":
-                self._pregrasp_navigator.finish_current_target("grasped" if self._wbc_grasp_success else "failed")
-                print(f"[GT-NAV] WBC grasp finished, success={self._wbc_grasp_success}", flush=True)
-                hold_cmd = self._get_wbc_hold_ee_pose_cmd()
-                action_env = self._generate_wbc_action_tensor(obs, zero_cmd, hold_cmd)
-                return {"action": self._action_tensor_to_output(action_env), "giveup": False}
+            grasp_done, grasp_success = arm_grasp_controller.step(robot, scene, self.dt)
+            if self.sit_down_actor is not None:
+                action_env = self._generate_sit_down_action_tensor(obs)
             else:
-                target_pos = trash_pos + np.array([0.0, 0.0, 0.20], dtype=np.float32)
+                action_env = self._generate_control_action_tensor(obs, zero_cmd, robot)
+            action_env = arm_grasp_controller.apply_to_action_tensor(action_env, robot)
 
-            ee_pose_cmd = self._compute_ee_pose_cmd(target_pos)
-            action_env = self._generate_wbc_action_tensor(obs, zero_cmd, ee_pose_cmd)
-
-            if self._wbc_grasp_step_count % 20 == 0:
+            if grasp_done:
+                self._pending_grasp_status = "grasped" if grasp_success else "failed"
+                self._reset_sit_down_tracking()
+                self._leg_posture_controller.start_stand_up(robot)
+                self._pregrasp_navigator.nav_state = "STAND_UP"
                 print(
-                    f"[GT-NAV] WBC Grasp step={self._wbc_grasp_step_count} "
-                    f"phase={self._wbc_grasp_phase} "
-                    f"target_pos={np.round(target_pos, 3)} "
-                    f"ee_cmd={np.round(ee_pose_cmd, 3)}",
+                    f"[GT-NAV] Arm grasp finished, success={grasp_success}. Starting stand up.",
                     flush=True,
                 )
-
-            if self._wbc_grasp_phase == "pregrasp" and self._wbc_grasp_step_count > 80:
-                self._wbc_grasp_phase = "grasp"
-                self._wbc_grasp_step_count = 0
-                print("[GT-NAV] WBC Grasp: pregrasp → grasp", flush=True)
-            elif self._wbc_grasp_phase == "grasp" and self._wbc_grasp_step_count > 100:
-                self._wbc_grasp_phase = "lift"
-                self._wbc_grasp_step_count = 0
-                print("[GT-NAV] WBC Grasp: grasp → lift", flush=True)
-            elif self._wbc_grasp_phase == "lift" and self._wbc_grasp_step_count > 80:
-                self._wbc_grasp_success = True
-                self._wbc_grasp_phase = "done"
-                print("[GT-NAV] WBC Grasp: lift → done", flush=True)
-
-            if self._wbc_grasp_step_count > self._wbc_grasp_timeout:
-                self._wbc_grasp_phase = "done"
-                print("[GT-NAV] WBC Grasp: timeout!", flush=True)
 
             return {"action": self._action_tensor_to_output(action_env), "giveup": False}
 
         if self._pregrasp_navigator.nav_state == "STAND_UP":
-            self._pregrasp_navigator.finish_current_target("failed")
+            zero_cmd = np.zeros(3, dtype=np.float32)
+            if robot is None:
+                self._pregrasp_navigator.finish_current_target(self._pending_grasp_status or "failed")
+                self._pending_grasp_status = None
+                return {"action": self._get_stand_still_action(obs), "giveup": False}
+            if self.sit_down_actor is not None:
+                action_env = self._generate_sit_down_action_tensor(obs)
+                self._sit_down_step_count += 1
+                if self._is_sit_down_stable(robot):
+                    self._sit_down_stable_count += 1
+                else:
+                    self._sit_down_stable_count = 0
+                stand_up_done = (
+                    self._sit_down_step_count >= self.sit_down_min_steps
+                    and self._sit_down_stable_count >= self.sit_down_stable_steps_required
+                )
+                if stand_up_done:
+                    self._reset_sit_down_tracking()
+                    self._pregrasp_navigator.finish_current_target(self._pending_grasp_status or "failed")
+                    self._pending_grasp_status = None
+            else:
+                action_env = self._generate_control_action_tensor(obs, zero_cmd, robot)
+                if self._leg_posture_controller.state == "IDLE":
+                    self._reset_sit_down_tracking()
+                    self._pregrasp_navigator.finish_current_target(self._pending_grasp_status or "failed")
+                    self._pending_grasp_status = None
+            return {"action": self._action_tensor_to_output(action_env), "giveup": False}
         
         # 处理 DONE 状态
         if nav_info["state"] == "DONE":
-            if self.wbc_actor is not None and robot is not None:
-                zero_cmd = np.zeros(3, dtype=np.float32)
-                self._ensure_wbc_nav_session(obs, zero_cmd)
-                hold_cmd = self._get_wbc_hold_ee_pose_cmd()
-                action_env = self._generate_wbc_action_tensor(obs, zero_cmd, hold_cmd)
-                return {"action": self._action_tensor_to_output(action_env), "giveup": False}
             return {"action": self._get_stand_still_action(obs), "giveup": False}
-        
-        # 导航阶段优先使用 WBC policy，保持末端位姿不变，同时沿用当前导航 base_cmd。
-        if self.wbc_actor is not None and robot is not None:
-            self._ensure_wbc_nav_session(obs, base_cmd)
-            hold_cmd = self._get_wbc_hold_ee_pose_cmd()
-            action_env = self._generate_wbc_action_tensor(obs, base_cmd, hold_cmd)
-            return {"action": self._action_tensor_to_output(action_env), "giveup": False}
 
         # 使用 actor 网络生成动作
         if robot is not None:

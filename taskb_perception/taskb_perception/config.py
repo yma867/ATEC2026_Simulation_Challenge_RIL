@@ -76,7 +76,7 @@ B2_PIPER_PROFILE = RobotProfile(
 # 训练产出（相对仓库根目录）— 不要带仓库目录名前缀，避免重复拼接 repo_root
 WEIGHT_HEAD_DET = "taskb_perception/runs/train_fast/head_det/weights/best.pt"
 WEIGHT_EE_DET = "taskb_perception/runs/train_fast/ee_det/weights/best.pt"
-WEIGHT_EE_SEG = "taskb_perception/ee_seg/ee_seg/weights/best.pt"
+WEIGHT_EE_SEG = "taskb_perception/runs/train_fast/ee_seg/weights/best.pt"
 
 
 @dataclass

@@ -22,3 +22,7 @@ ATEC2026_Simulation_Challenge_RIL/logs/rsl_rl/unitree_b2_piper_stand_height_flat
 
 # 修改臂初始位置在
 task_b/env_cfg.py
+
+# 调整机械臂的位置
+joint5=-0.8 可视距离 1.1m
+joint5=-0.6 可视距离 1.08m

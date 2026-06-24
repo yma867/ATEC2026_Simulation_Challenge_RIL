@@ -310,20 +310,18 @@ class ArmGraspController:
             arm_target = robot.data.joint_pos[:, self.arm_joint_ids].clone()
         else:
             arm_target = self.desired_arm_joint_pos.to(device=action_env.device, dtype=action_env.dtype)
-
         if self.desired_gripper_joint_pos is None:
             gripper_target = robot.data.joint_pos[:, self.gripper_joint_ids].clone()
         else:
             gripper_target = self.desired_gripper_joint_pos.to(device=action_env.device, dtype=action_env.dtype).view(1, -1)
 
         default_joint_pos = robot.data.default_joint_pos.to(device=action_env.device, dtype=action_env.dtype)
-        # 使用 b2_piper_arm_defaults 覆盖机械臂默认位置
-        if hasattr(self, 'b2_piper_arm_defaults'):
-            for name, pos in self.b2_piper_arm_defaults.items():
-                if name in self.arm_joint_names:
-                    idx = self.arm_joint_names.index(name)
-                    default_joint_pos[:, self.arm_joint_ids[idx]] = pos
-        action_env[:, self.arm_joint_ids] = (arm_target - default_joint_pos[:, self.arm_joint_ids]) / self.action_scale
+        arm_default_target = default_joint_pos[:, self.arm_joint_ids].clone()
+        if hasattr(self, "b2_piper_arm_defaults"):
+            for local_idx, joint_name in enumerate(self.arm_joint_names):
+                if joint_name in self.b2_piper_arm_defaults:
+                    arm_default_target[:, local_idx] = float(self.b2_piper_arm_defaults[joint_name])
+        action_env[:, self.arm_joint_ids] = (arm_target - arm_default_target) / self.action_scale
         action_env[:, self.gripper_joint_ids] = (gripper_target - default_joint_pos[:, self.gripper_joint_ids]) / self.action_scale
         return action_env
 

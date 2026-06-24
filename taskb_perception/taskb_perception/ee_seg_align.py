@@ -161,7 +161,8 @@ class EESegAligner:
             return []
 
         h, w = ee_rgb.shape[:2]
-        results = self._yolo.predict(ee_rgb, verbose=False, conf=self.cfg.conf_threshold)
+        bgr = ee_rgb[..., ::-1]
+        results = self._yolo.predict(bgr, verbose=False, conf=self.cfg.conf_threshold)
         centers: list[EESegCenter] = []
 
         for r in results:
