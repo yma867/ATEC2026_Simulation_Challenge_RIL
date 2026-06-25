@@ -6,7 +6,16 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import torch
-from isaaclab.utils.math import quat_apply
+
+try:
+    from isaaclab.utils.math import quat_apply
+except ImportError:
+    def quat_apply(quat: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
+        x, y, z, w = quat[..., 0], quat[..., 1], quat[..., 2], quat[..., 3]
+        t = 2.0 * (x * vec[..., 0] + y * vec[..., 1] + z * vec[..., 2])
+        return vec + w * t + torch.cross(
+            torch.stack([x, y, z], dim=-1), vec * 2.0 - vec * t.unsqueeze(-1), dim=-1
+        )
 
 # 抓取朝下（wxyz）
 EE_TOPDOWN_QUAT_WXYZ = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)

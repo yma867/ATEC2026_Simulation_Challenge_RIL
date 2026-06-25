@@ -32,20 +32,19 @@ class ObjectDetector:
         if w:
             weights_path = self._resolve_weights(w)
             self._weights_path = weights_path
-            if not weights_path.is_file():
-                print(f"[ObjectDetector] 权重不存在: {weights_path}，将使用颜色回退")
-            else:
-                try:
-                    from ultralytics import YOLO
+            self._load_weights(weights_path)
 
-                    self._yolo = YOLO(str(weights_path))
-                    names = getattr(self._yolo, "names", None)
-                    print(
-                        f"[ObjectDetector] YOLO loaded: weights={weights_path} ",
-                        flush=True,
-                    )
-                except Exception as exc:
-                    print(f"[ObjectDetector] YOLO 加载失败，将使用颜色回退: {exc}")
+    def _load_weights(self, weights_path: Path) -> None:
+        if not weights_path.is_file():
+            print(f"[ObjectDetector] YOLO 权重不存在: {weights_path}")
+            return
+        try:
+            from ultralytics import YOLO
+
+            self._yolo = YOLO(str(weights_path))
+            print(f"[ObjectDetector] 已加载 YOLO 权重: {weights_path}")
+        except Exception as exc:
+            print(f"[ObjectDetector] YOLO 加载失败: {exc}")
 
     @staticmethod
     def _resolve_weights(weights: str | Path) -> Path:

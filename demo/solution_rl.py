@@ -279,15 +279,15 @@ class AlgSolution:
         self._candidate_seen_count = 0
         self._search_no_target_count = 0
         self.SEARCH_SPIN_AFTER_NO_TARGET_STEPS = 5
-        self.SEARCH_SPIN_WZ = 0.4
+        self.SEARCH_SPIN_WZ = 0.3
         self.ACTIVE_TARGET_ACQUIRE_STEPS = 3
         self.TARGET_MAX_DEPTH_JUMP_M = 0.8
         self.TARGET_MAX_ERRU_JUMP_PX = 160.0
         self.TARGET_AREA_RATIO_MIN = 0.4
         self.TARGET_AREA_RATIO_MAX = 2.8
-        self.HEAD_PRE_CROUCH_DEPTH_M = 0.5
+        self.HEAD_PRE_CROUCH_DEPTH_M = 0.55
         self.HEAD_PRE_CROUCH_DEPTH_EPS_M = 0.05
-        self.HEAD_LOST_DIRECT_CROUCH_DEPTH_M = 0.7
+        self.HEAD_LOST_DIRECT_CROUCH_DEPTH_M = 0.72
         self.HEAD_LOST_DIRECT_CROUCH_STEPS = 8
         self.HEAD_APPROACH_LOST_GIVEUP_STEPS = 40
         self.EE_TRACK_LOST_GIVEUP_STEPS = 80
@@ -338,9 +338,9 @@ class AlgSolution:
 
     def _resolve_policy_path(self) -> str:
         candidates = [
-            os.path.join(_DEMO_DIR, "model_4999.pt"),
-            os.path.join(_REPO_ROOT, "logs", "rsl_rl", "unitree_b2_piper_flat", "2026-06-02_14-40-32", "model_4999.pt"),
-            os.path.join(_REPO_ROOT, "atec_robot_model", "baseline", "unitree_b2_flat", "policy.pt"),
+            os.path.join(_DEMO_DIR, "policy_di.pt"),
+            #os.path.join(_DEMO_DIR, "model_4999.pt"),
+            #os.path.join(_REPO_ROOT, "atec_robot_model", "baseline", "unitree_b2_flat", "policy.pt"),
         ]
         for path in candidates:
             if os.path.isfile(path):
