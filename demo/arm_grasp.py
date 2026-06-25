@@ -199,17 +199,18 @@ class ArmGraspController:
         self.current_target_pos_w_compensated = self.current_target_pos_w.copy()
         raw_target_pos_b = self._world_pos_to_base_frame(self.current_target_pos_w)
         self.current_target_pos_b_raw = None if raw_target_pos_b is None else raw_target_pos_b.detach().cpu().numpy()[0]
+        if target_quat_w is None:
+            target_quat_w = self._compute_top_down_target_quat_w(self.current_target_pos_w)
 
         # Compensate for gripper_base to fingertip offset
         # gripper_base origin is at the base of the gripper, but fingertips extend
         # 0.1358m along gripper_base's local Z axis. We need to move gripper_base
         # BACKWARD so that fingertips end up at the target position.
-        ee_pos_w, ee_quat_w = self.get_ee_pose()
-        ee_quat_t = torch.tensor(ee_quat_w, dtype=torch.float32, device=self.device).unsqueeze(0)
+        target_quat_t = torch.tensor(target_quat_w, dtype=torch.float32, device=self.device).unsqueeze(0)
         # gripper_base local Z axis in world frame
         local_z = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=self.device).unsqueeze(0)
         from isaaclab.utils.math import quat_rotate
-        z_world = quat_rotate(ee_quat_t, local_z).squeeze(0).cpu().numpy()
+        z_world = quat_rotate(target_quat_t, local_z).squeeze(0).cpu().numpy()
         # Offset gripper_base backward along its Z axis so fingertips reach target
         finger_offset = float(os.getenv("ATEC_TASKB_FINGER_OFFSET", "0.12"))
         disable_finger_comp = os.getenv("ATEC_TASKB_DISABLE_FINGER_COMP", "1").lower() in {"1", "true", "yes", "on"}
@@ -224,8 +225,6 @@ class ArmGraspController:
         if target_pos_b is None:
             return
 
-        if target_quat_w is None:
-            target_quat_w = self._compute_top_down_target_quat_w(compensated_target)
         target_quat_b = self._world_quat_to_base_frame(target_quat_w)
         if target_quat_b is None:
             return

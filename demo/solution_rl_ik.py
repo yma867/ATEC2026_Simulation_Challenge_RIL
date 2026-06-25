@@ -103,15 +103,14 @@ class AlgSolution:
     ]
     EE_BODY_NAME = "gripper_base"
     CROUCH_ARM_JOINT2_POS = 3.14
-    CROUCH_ARM_JOINT3_POS = -1.8
-    CROUCH_ARM_JOINT5_POS = -0.8
+    CROUCH_ARM_JOINT3_POS = -1.5
+    CROUCH_ARM_JOINT5_POS = -0.4
     PRE_CROUCH_ARM_MAX_STEP = 0.04
     PRE_CROUCH_ARM_READY_RAD = 0.20
     PRE_CROUCH_ARM_TIMEOUT_STEPS = 40
     ARM_CROUCH_ALPHA_STEP = 0.08
     PREGRASP_ARM_SETTLE_STEPS = 15
-    PREGRASP_ARM_TIMEOUT_STEPS = 60
-    PREGRASP_HOLD_TIMEOUT_STEPS = 70
+    PREGRASP_ARM_TIMEOUT_STEPS = 80
     PRE_CROUCH_SETTLE_MIN_STEPS = 12
     PRE_CROUCH_SETTLE_TIMEOUT_STEPS = 20
     PRE_CROUCH_SETTLE_YAW_RATE_THRESH = 0.12
@@ -299,7 +298,7 @@ class AlgSolution:
         self._candidate_seen_count = 0
         self._search_no_target_count = 0
         self.SEARCH_SPIN_AFTER_NO_TARGET_STEPS = 5
-        self.SEARCH_SPIN_WZ = 0.4
+        self.SEARCH_SPIN_WZ = 0.3
         self.ACTIVE_TARGET_ACQUIRE_STEPS = 3
         self.TARGET_LOST_KEEP_STEPS = 35
         self.TARGET_MAX_DEPTH_JUMP_M = 0.8
@@ -307,12 +306,10 @@ class AlgSolution:
         self.TARGET_AREA_RATIO_MIN = 0.4
         self.TARGET_AREA_RATIO_MAX = 2.8
         self.HANDOVER_DEPTH_M = 0.4
-        self.HEAD_PRE_CROUCH_DEPTH_M = 0.5
-        self.HEAD_PRE_CROUCH_DEPTH_EPS_M = 0.00
-        self.HEAD_LOST_DIRECT_CROUCH_DEPTH_M = 0.75
-        self.HEAD_LOST_DIRECT_CROUCH_STEPS = 6
-        self.HEAD_APPROACH_LOST_GIVEUP_STEPS = 40
-        self.EE_TRACK_LOST_GIVEUP_STEPS = 80
+        self.HEAD_PRE_CROUCH_DEPTH_M = 0.55
+        self.HEAD_PRE_CROUCH_DEPTH_EPS_M = 0.05
+        self.HEAD_LOST_DIRECT_CROUCH_DEPTH_M = 0.65
+        self.HEAD_LOST_DIRECT_CROUCH_STEPS = 5
         self.HEAD_PRE_CROUCH_ERR_PX = 45.0
         self.FINAL_APPROACH_TRIGGER_M = 0.8
         self.FINAL_CROUCH_DEPTH_M = 0.8
@@ -368,7 +365,7 @@ class AlgSolution:
 
     def _resolve_policy_path(self) -> str:
         candidates = [
-            #os.path.join(_DEMO_DIR, "policy.pt"),
+            os.path.join(_DEMO_DIR, "policy.pt"),
             os.path.join(_REPO_ROOT, "logs", "rsl_rl", "unitree_b2_piper_flat", "2026-06-02_14-40-32", "model_4999.pt"),
             os.path.join(_REPO_ROOT, "atec_robot_model", "baseline", "unitree_b2_flat", "policy.pt"),
         ]
@@ -1385,13 +1382,6 @@ class AlgSolution:
                     return 0.0, 0.0, "SEARCH_WAIT"
                 if self._target_lost_count <= self.FINAL_APPROACH_KEEP_STEPS:
                     return self._final_approach_vx, self._final_approach_wz, "EE_TRACK"
-                if self._target_lost_count >= self.EE_TRACK_LOST_GIVEUP_STEPS:
-                    self._log(
-                        f"[TaskB-RL] EE_TRACK lost {self._target_lost_count} steps, "
-                        f"giving up target -> SEARCH_SPIN"
-                    )
-                    self._clear_target_lock()
-                    return 0.0, self.SEARCH_SPIN_WZ, "SEARCH_SPIN"
                 last_err_u = float(self._active_target.get("err_u", 0.0)) if self._active_target is not None else 0.0
                 if abs(last_err_u) > 30.0:
                     lost_wz = float(np.clip(-0.0040 * last_err_u, -0.4, 0.4))
@@ -1438,13 +1428,6 @@ class AlgSolution:
                     self._target_stage = "EE_TRACK"
                     self._target_lost_count = 0
                     return 0.0, 0.0, "EE_REACQUIRE"
-                if self._target_lost_count >= self.HEAD_APPROACH_LOST_GIVEUP_STEPS:
-                    self._log(
-                        f"[TaskB-RL] HEAD_APPROACH lost {self._target_lost_count} steps, "
-                        f"giving up target -> SEARCH_SPIN"
-                    )
-                    self._clear_target_lock()
-                    return 0.0, self.SEARCH_SPIN_WZ, "SEARCH_SPIN"
                 return 0.0, 0.0, "SEARCH_WAIT"
 
             if self._target_stage == "EE_BASE_ALIGN":
@@ -1615,20 +1598,13 @@ class AlgSolution:
         arm = self._ensure_arm_controller()
         if arm is None or robot is None:
             return action_env
+        default_target = self._arm_default_action[:, :len(arm.arm_joint_ids)].to(device=action_env.device, dtype=action_env.dtype)
         crouch_target = self._crouch_arm_target(arm, action_env.device, action_env.dtype)
-        self._crouch_arm_hold_jpos = crouch_target.detach().clone()
-        arm.desired_arm_joint_pos = crouch_target
+        self._arm_crouch_alpha = float(np.clip(self._arm_crouch_alpha + self.ARM_CROUCH_ALPHA_STEP, 0.0, 1.0))
+        arm_target = default_target + (crouch_target - default_target) * self._arm_crouch_alpha
+        self._crouch_arm_hold_jpos = arm_target.detach().clone()
+        arm.desired_arm_joint_pos = arm_target
         arm.open_gripper()
-        # if self._step % 10 == 0:
-        #     cur_jpos = robot.data.joint_pos[0, arm.arm_joint_ids].detach().cpu().numpy()
-        #     tgt_jpos = crouch_target[0].detach().cpu().numpy()
-        #     err_jpos = np.abs(cur_jpos - tgt_jpos)
-        #     self._log(
-        #         f"[CROUCH_ARM]\n"
-        #         f"  current={np.round(cur_jpos, 4).tolist()}\n"
-        #         f"  target ={np.round(tgt_jpos, 4).tolist()}\n"
-        #         f"  error  ={np.round(err_jpos, 4).tolist()}"
-        #     )
         return arm.apply_to_action_tensor(action_env, robot)
 
     def _get_root_yaw_rate(self, robot) -> float:
@@ -2035,28 +2011,86 @@ class AlgSolution:
             if arm is not None:
                 self._pregrasp_ee_quat_w = arm.get_ee_pose()[1].copy()
                 self._log(f"[TaskB-RL] PREGRASP captured ee_quat_w={np.round(self._pregrasp_ee_quat_w, 4)}")
+        if self._pending_grasp_target is None and arm is not None:
+            self._build_pending_grasp_from_head_target(obs, robot, arm)
 
-        action_env = self._apply_crouch_arm_pose(action_env, robot)
+        has_grasp_target = self._pending_grasp_target is not None and self._pending_grasp_pos_w is not None
+        if has_grasp_target:
+            if arm is not None:
+                pregrasp_pos_w = np.asarray(
+                    self._pending_grasp_pos_w + np.array([0.0, 0.0, arm.pregrasp_height], dtype=np.float32),
+                    dtype=np.float32,
+                )
+                target_quat_w = self._pregrasp_ee_quat_w if self._pregrasp_ee_quat_w is not None else self._pending_grasp_quat_w
+                arm.open_gripper()
+                arm.move_ee_to_pose(pregrasp_pos_w, target_quat_w)
+                action_env = arm.apply_to_action_tensor(action_env, robot)
+                ee_pos_w, current_ee_quat_w = arm.get_ee_pose()
+                if arm.ee_reached(ee_pos_w, pregrasp_pos_w):
+                    self._pregrasp_reach_stable_count += 1
+                else:
+                    self._pregrasp_reach_stable_count = 0
+                if self._step % 10 == 0:
+                    err = float(np.linalg.norm(np.asarray(ee_pos_w) - pregrasp_pos_w))
+                    ik_jpos = arm.desired_arm_joint_pos.detach().cpu().numpy()[0] if arm.desired_arm_joint_pos is not None else None
+                    cur_jpos = robot.data.joint_pos[0, arm.arm_joint_ids].detach().cpu().numpy()
+                    ik_target_b = arm.current_target_pos_b
+                    tgt_quat = arm.current_target_pos_w
+                    from isaaclab.utils.math import quat_rotate
+                    ee_quat_t = torch.tensor(current_ee_quat_w, dtype=torch.float32, device=arm.device).unsqueeze(0)
+                    local_z = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=arm.device).unsqueeze(0)
+                    ee_z_world = quat_rotate(ee_quat_t, local_z).squeeze(0).cpu().numpy()
+                    print(
+                        f"[TaskB-RL] PREGRASP head_ik err={err:.3f}m "
+                        f"stable={self._pregrasp_reach_stable_count}/{self.PREGRASP_REACH_STABLE_STEPS}\n"
+                        f"  pregrasp_w={np.round(pregrasp_pos_w,3)} ee_w={np.round(ee_pos_w,3)}\n"
+                        f"  ik_target_b={np.round(ik_target_b,3) if ik_target_b is not None else None}\n"
+                        f"  ee_quat_w={np.round(current_ee_quat_w,4)} ee_z_world={np.round(ee_z_world,3)}\n"
+                        f"  ik_jpos={np.round(ik_jpos,3).tolist() if ik_jpos is not None else None}\n"
+                        f"  cur_jpos={np.round(cur_jpos,3).tolist()}",
+                        flush=True,
+                    )
+                if self._pregrasp_reach_stable_count < self.PREGRASP_REACH_STABLE_STEPS:
+                    return action_env
+                current_ee_quat_w = arm.get_ee_pose()[1]
+                arm.start_grasp(
+                    self._pending_grasp_target,
+                    self._pending_grasp_pos_w,
+                    current_ee_quat_w=current_ee_quat_w if self._pending_grasp_quat_w is None else self._pending_grasp_quat_w,
+                )
+                self._task_state = "GRASP_ARM"
+                self._pregrasp_reach_stable_count = 0
+                print(f"[TaskB-RL] PREGRASP -> GRASP_ARM id={self._pending_grasp_target.get('id')}", flush=True)
+                return action_env
 
-        pregrasp_hold_steps = self._pregrasp_arm_step - self.PREGRASP_ARM_TIMEOUT_STEPS
-        if pregrasp_hold_steps >= self.PREGRASP_HOLD_TIMEOUT_STEPS:
-            self._log(
-                f"[TaskB-RL] PREGRASP hold timeout {pregrasp_hold_steps}/{self.PREGRASP_HOLD_TIMEOUT_STEPS} steps, "
-                f"giving up target -> STAND_UP"
-            )
             self._pending_grasp_status = "failed"
-            self._mark_active_target_processed(success=False)
             self._entered_crouch_from_yolo = False
             self._reset_sit_down_tracking()
             self._leg_posture_controller.start_stand_up(robot)
             self._task_state = "STAND_UP"
+            print("[TaskB-RL] arm controller unavailable in PREGRASP, start stand up.", flush=True)
             return action_env
 
-        if self._step % 20 == 0:
-            self._log(
-                f"[TaskB-RL] PREGRASP holding crouch arm pose (no IK) "
-                f"hold={pregrasp_hold_steps}/{self.PREGRASP_HOLD_TIMEOUT_STEPS}"
-            )
+        if self._entered_crouch_from_yolo:
+            if self._crouch_wait_start_step < 0:
+                self._crouch_wait_start_step = self._step
+            wait_elapsed = self._step - self._crouch_wait_start_step
+            if wait_elapsed < self.WAIT_GRASP_TIMEOUT_STEPS:
+                if self._step % 20 == 0:
+                    print(
+                        f"[TaskB-RL] PREGRASP waiting target_grasp "
+                        f"({wait_elapsed}/{self.WAIT_GRASP_TIMEOUT_STEPS})",
+                        flush=True,
+                    )
+                return action_env
+            print("[TaskB-RL] PREGRASP wait target_grasp timeout → STAND_UP", flush=True)
+
+        self._pending_grasp_status = "failed"
+        self._entered_crouch_from_yolo = False
+        self._reset_sit_down_tracking()
+        self._leg_posture_controller.start_stand_up(robot)
+        self._task_state = "STAND_UP"
+        self._crouch_wait_start_step = -1
         return action_env
 
     def _step_arm_grasp(self, obs: dict) -> torch.Tensor:
@@ -2101,20 +2135,8 @@ class AlgSolution:
             self._clear_pending_grasp()
             return self._leg_action(obs, zero_cmd)
 
-        if self.sit_down_actor is not None:
-            action_env = self._generate_sit_down_action_tensor(obs)
-            self._sit_down_step_count += 1
-            if self._is_sit_down_stable(robot):
-                self._sit_down_stable_count += 1
-            else:
-                self._sit_down_stable_count = 0
-            stand_up_done = (
-                self._sit_down_step_count >= self.sit_down_min_steps
-                and self._sit_down_stable_count >= self.sit_down_stable_steps_required
-            )
-        else:
-            action_env = self._generate_control_action_tensor(obs, zero_cmd, robot)
-            stand_up_done = self._leg_posture_controller.state == "IDLE"
+        action_env = self._generate_control_action_tensor(obs, zero_cmd, robot)
+        stand_up_done = self._leg_posture_controller.state == "IDLE"
 
         action_env = self._apply_carry_arm(action_env)
         if stand_up_done:
@@ -2240,6 +2262,9 @@ class AlgSolution:
         if score_delta > 0.001:
             print(f"[+{score_delta:.2f}] Score: {current_score:.2f} | Step: {self._step}", flush=True)
         self._last_score = current_score
+
+        if current_score > 1:
+            return {"action": [], "giveup": True}
 
         self._process_camera_debug()
 

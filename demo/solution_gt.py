@@ -37,7 +37,7 @@ except Exception:
 # 导航模式选择开关
 # 可选值: "nearest" - 找最近的目标; "order" - 按编号顺序 object1-18
 #        "keyboard" - Isaac/Omniverse 键盘手动控制（终端输入兜底）
-NAV_MODE = os.getenv("ATEC_TASKB_NAV_MODE", "keyboard").lower()
+NAV_MODE = os.getenv("ATEC_TASKB_NAV_MODE", "nearest").lower()
 assert NAV_MODE in ["nearest", "order", "keyboard"], (
     f"Invalid NAV_MODE: {NAV_MODE}. Must be 'nearest', 'order' or 'keyboard'"
 )
