@@ -1,0 +1,92 @@
+seed: 42
+device: cuda:0
+num_steps_per_env: 24
+max_iterations: 1
+empirical_normalization: false
+obs_groups: {}
+clip_actions: null
+save_interval: 100
+experiment_name: unitree_go2_parkour
+run_name: ''
+logger: tensorboard
+neptune_project: isaaclab
+wandb_project: isaaclab
+resume: false
+load_run: .*
+load_checkpoint: model_.*.pt
+class_name: OnPolicyRunner
+policy:
+  class_name: ActorCriticRMA
+  init_noise_std: 1.0
+  noise_std_type: scalar
+  state_dependent_std: false
+  actor_obs_normalization: {}
+  critic_obs_normalization: {}
+  actor_hidden_dims:
+  - 512
+  - 256
+  - 128
+  critic_hidden_dims:
+  - 512
+  - 256
+  - 128
+  activation: elu
+  tanh_encoder_output: false
+  scan_encoder_dims:
+  - 128
+  - 64
+  - 32
+  priv_encoder_dims:
+  - 64
+  - 20
+  actor:
+    num_priv_explicit: 9
+    num_priv_latent: 29
+    num_prop: 53
+    num_scan: 132
+    num_hist: 10
+    class_name: Actor
+    state_history_encoder:
+      num_priv_explicit: 9
+      num_priv_latent: 29
+      num_prop: 53
+      num_scan: 132
+      num_hist: 10
+      class_name: StateHistoryEncoder
+      channel_size: 10
+algorithm:
+  class_name: PPOWithExtractor
+  num_learning_epochs: 5
+  num_mini_batches: 4
+  learning_rate: 0.0002
+  schedule: adaptive
+  gamma: 0.99
+  lam: 0.95
+  entropy_coef: 0.01
+  desired_kl: 0.01
+  max_grad_norm: 1.0
+  value_loss_coef: 1.0
+  use_clipped_value_loss: true
+  clip_param: 0.2
+  normalize_advantage_per_mini_batch: false
+  rnd_cfg: null
+  symmetry_cfg: null
+  dagger_update_freq: 20
+  priv_reg_coef_schedual:
+  - 0.0
+  - 0.1
+  - 2000.0
+  - 3000.0
+estimator:
+  num_priv_explicit: 9
+  num_priv_latent: 29
+  num_prop: 53
+  num_scan: 132
+  num_hist: 10
+  class_name: DefaultEstimator
+  train_with_estimated_states: true
+  learning_rate: 0.0001
+  hidden_dims:
+  - 128
+  - 64
+depth_encoder: null
