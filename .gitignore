@@ -81,3 +81,5 @@ tests/
 **/tactile_record/*
 **/gelsight_r15_data/*
 
+taskb_perception/ee_seg.zip
+taskb_perception/train_fast.zip
