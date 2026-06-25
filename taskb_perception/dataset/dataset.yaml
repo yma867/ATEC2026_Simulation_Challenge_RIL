@@ -1,8 +1,0 @@
-# Task B YOLO 数据集（由 collect_yolo_dataset.py 自动生成，此处为占位）
-path: taskb_perception/dataset
-train: images/train
-val: images/val
-names:
-  0: sugar
-  1: mustard
-  2: banana

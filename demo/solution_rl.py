@@ -47,8 +47,7 @@ if os.path.isdir(_PERCEPTION_DIR) and _PERCEPTION_DIR not in sys.path:
 
 from taskb_perception.config import CAM_CX, CAM_CY, CAM_FX, CAM_FY, TARGET_BIN_RADIUS as BIN_RADIUS, TARGET_BIN_XY  # noqa: E402
 from taskb_perception import AxisNavController, PerceptionConfig  # noqa: E402
-from taskb_perception.obs_utils import parse_depth, pixel_to_cam, sample_depth_median  # noqa: E402
-from taskb_perception.ee_seg_align import EESegAligner  # noqa: E402
+from taskb_perception.obs_utils import parse_depth, pixel_to_cam, sample_depth_median  # noqa: E402  # noqa: E402
 from taskb_perception.types import ObjectClass  # noqa: E402
 from taskb_perception.math3d import quat_multiply, quat_rotate_vector, transform_point_cam_to_base  # noqa: E402
 from taskb_perception.yolo_labels import CLASS_NAMES, NUM_OBJECTS, object_index_to_class  # noqa: E402
@@ -157,12 +156,6 @@ class AlgSolution:
         self.policy = self._load_leg_policy(policy_path)
         self._leg_mode = "rl" if self.policy is not None else "scripted"
 
-        if RgbdPureDualPipeline is not None:
-            self.perception = RgbdPureDualPipeline()
-        else:
-            self.perception = None
-            print("[TaskB-RL] WARN: RgbdPureDualPipeline 不可用，抓取阶段将尽量依赖 YOLO 导航", flush=True)
-
         self.nav_cfg = PerceptionConfig(
             nav_method="axis_align",
             nav_detect_source="both",
@@ -173,7 +166,6 @@ class AlgSolution:
             use_color_fallback=True,
         )
         self.axis_nav = AxisNavController(self.nav_cfg)
-        self._ee_seg = EESegAligner(self.nav_cfg)
         self._last_nav_vel = np.zeros(3, dtype=np.float32)
         print("[TaskB-RL] ✓ YOLO 光轴导航已启用 (axis_align + Memory Bank)", flush=True)
 
@@ -307,9 +299,9 @@ class AlgSolution:
         self.TARGET_AREA_RATIO_MIN = 0.4
         self.TARGET_AREA_RATIO_MAX = 2.8
         self.HANDOVER_DEPTH_M = 0.4
-        self.HEAD_PRE_CROUCH_DEPTH_M = 0.5
-        self.HEAD_PRE_CROUCH_DEPTH_EPS_M = 0.00
-        self.HEAD_LOST_DIRECT_CROUCH_DEPTH_M = 0.75
+        self.HEAD_PRE_CROUCH_DEPTH_M = 0.6
+        self.HEAD_PRE_CROUCH_DEPTH_EPS_M = 0.05
+        self.HEAD_LOST_DIRECT_CROUCH_DEPTH_M = 0.7
         self.HEAD_LOST_DIRECT_CROUCH_STEPS = 6
         self.HEAD_APPROACH_LOST_GIVEUP_STEPS = 40
         self.EE_TRACK_LOST_GIVEUP_STEPS = 80
@@ -368,7 +360,7 @@ class AlgSolution:
 
     def _resolve_policy_path(self) -> str:
         candidates = [
-            #os.path.join(_DEMO_DIR, "policy.pt"),
+            os.path.join(_DEMO_DIR, "model_4999.pt"),
             os.path.join(_REPO_ROOT, "logs", "rsl_rl", "unitree_b2_piper_flat", "2026-06-02_14-40-32", "model_4999.pt"),
             os.path.join(_REPO_ROOT, "atec_robot_model", "baseline", "unitree_b2_flat", "policy.pt"),
         ]
