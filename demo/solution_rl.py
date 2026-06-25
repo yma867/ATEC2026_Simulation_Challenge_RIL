@@ -47,10 +47,7 @@ if os.path.isdir(_PERCEPTION_DIR) and _PERCEPTION_DIR not in sys.path:
 
 from taskb_perception.config import CAM_CX, CAM_CY, CAM_FX, CAM_FY, TARGET_BIN_RADIUS as BIN_RADIUS, TARGET_BIN_XY  # noqa: E402
 from taskb_perception import AxisNavController, PerceptionConfig  # noqa: E402
-from taskb_perception.obs_utils import parse_depth, pixel_to_cam, sample_depth_median  # noqa: E402  # noqa: E402
-from taskb_perception.types import ObjectClass  # noqa: E402
-from taskb_perception.math3d import quat_multiply, quat_rotate_vector, transform_point_cam_to_base  # noqa: E402
-from taskb_perception.yolo_labels import CLASS_NAMES, NUM_OBJECTS, object_index_to_class  # noqa: E402
+from taskb_perception.obs_utils import parse_depth  # noqa: E402  # noqa: E402
 
 BIN_CENTER = np.array([TARGET_BIN_XY[0], TARGET_BIN_XY[1], 0.0], dtype=np.float32)
 
@@ -61,12 +58,6 @@ BIN_CENTER = np.array([TARGET_BIN_XY[0], TARGET_BIN_XY[1], 0.0], dtype=np.float3
 ATEC_CAMERA_FOLLOW_ROBOT = os.getenv("ATEC_TASKB_CAMERA_FOLLOW", "0").lower() in {
     "1", "true", "yes", "on",
 }
-
-try:
-    from rgbd_pure_dual_pipeline import RgbdPureDualPipeline  # noqa: E402
-except ImportError:
-    RgbdPureDualPipeline = None
-
 
 class _StreamToLogger:
     def __init__(self, log_fp, fallback_stream):
@@ -282,10 +273,7 @@ class AlgSolution:
         # Active visual target tracking
         self._active_target = None
         self._processed_targets = []
-        self._target_stage = "NONE"  # NONE / EE_TRACK / HEAD_APPROACH / EE_BASE_ALIGN / PRE_CROUCH
-        self._head_confirm_count = 0
-        self._pre_crouch_confirm_count = 0
-        self._pre_crouch_wait_steps = 0
+        self._target_stage = "NONE"  # NONE / EE_TRACK / HEAD_APPROACH / PRE_CROUCH
         self._target_lost_count = 0
         self._candidate_target = None
         self._candidate_seen_count = 0
@@ -293,24 +281,17 @@ class AlgSolution:
         self.SEARCH_SPIN_AFTER_NO_TARGET_STEPS = 5
         self.SEARCH_SPIN_WZ = 0.4
         self.ACTIVE_TARGET_ACQUIRE_STEPS = 3
-        self.TARGET_LOST_KEEP_STEPS = 35
         self.TARGET_MAX_DEPTH_JUMP_M = 0.8
         self.TARGET_MAX_ERRU_JUMP_PX = 160.0
         self.TARGET_AREA_RATIO_MIN = 0.4
         self.TARGET_AREA_RATIO_MAX = 2.8
-        self.HANDOVER_DEPTH_M = 0.4
-        self.HEAD_PRE_CROUCH_DEPTH_M = 0.6
+        self.HEAD_PRE_CROUCH_DEPTH_M = 0.5
         self.HEAD_PRE_CROUCH_DEPTH_EPS_M = 0.05
         self.HEAD_LOST_DIRECT_CROUCH_DEPTH_M = 0.7
-        self.HEAD_LOST_DIRECT_CROUCH_STEPS = 6
+        self.HEAD_LOST_DIRECT_CROUCH_STEPS = 8
         self.HEAD_APPROACH_LOST_GIVEUP_STEPS = 40
         self.EE_TRACK_LOST_GIVEUP_STEPS = 80
-        self.HEAD_PRE_CROUCH_ERR_PX = 45.0
-        self.FINAL_APPROACH_TRIGGER_M = 0.8
-        self.FINAL_CROUCH_DEPTH_M = 0.8
         self.FINAL_APPROACH_KEEP_STEPS = 8
-        self.HEAD_CONFIRM_STEPS = 5
-        self.PRE_CROUCH_CONFIRM_STEPS = 7
         self._verbose_reject_logs = os.getenv("ATEC_TASKB_VERBOSE_REJECT_LOGS", "0").lower() in {"1", "true", "yes", "on"}
         self._reject_log_last_step: dict[tuple[str, str, str], int] = {}
         self._final_approach_vx = 0.0
@@ -320,9 +301,6 @@ class AlgSolution:
         self._entered_crouch_from_yolo = False
         self.WAIT_GRASP_TIMEOUT_STEPS = 200
         self._crouch_wait_start_step = -1
-        self._ee_align_step = 0
-        self._ee_align_max_steps = 120
-        self._ee_align_gain_m_per_px = 0.0004
 
         print(
             f"[TaskB-RL] full loop: search→crouch→grasp→stand→carry→drop | "
@@ -569,8 +547,6 @@ class AlgSolution:
         return None
 
     def reset(self) -> None:
-        if self.perception is not None:
-            self.perception.reset()
         self.axis_nav.reset()
         self._task_state = "SEARCH"
         self._step = 0
@@ -605,9 +581,6 @@ class AlgSolution:
         self._active_target = None
         self._processed_targets = []
         self._target_stage = "NONE"
-        self._head_confirm_count = 0
-        self._pre_crouch_confirm_count = 0
-        self._pre_crouch_wait_steps = 0
         self._target_lost_count = 0
         self._candidate_target = None
         self._candidate_seen_count = 0
@@ -624,7 +597,6 @@ class AlgSolution:
         self._clear_active_target()
         self._final_approach_vx = 0.0
         self._final_approach_wz = 0.0
-        self._pre_crouch_wait_steps = 0
         self._pre_crouch_settle_steps = 0
 
     @staticmethod
@@ -876,8 +848,6 @@ class AlgSolution:
     def _clear_active_target(self) -> None:
         self._active_target = None
         self._target_stage = "NONE"
-        self._head_confirm_count = 0
-        self._pre_crouch_confirm_count = 0
         self._target_lost_count = 0
         self._candidate_target = None
         self._candidate_seen_count = 0
@@ -924,24 +894,6 @@ class AlgSolution:
         if matched is None:
             return None
         return matched
-
-    def _head_assisted_depth(self, ee_target, head_target, include_active: bool = True) -> float:
-        depths = []
-        if ee_target is not None:
-            depth = float(getattr(ee_target, "depth_m", 0.0))
-            if depth > 0.05:
-                depths.append(depth)
-        if head_target is not None:
-            depth = float(getattr(head_target, "depth_m", 0.0))
-            if depth > 0.05:
-                depths.append(depth)
-        if include_active and self._active_target is not None:
-            depth = float(self._active_target.get("depth", 0.0))
-            if depth > 0.05:
-                depths.append(depth)
-        if not depths:
-            return 0.0
-        return float(min(depths))
 
     def _scene(self):
         if self.env is None:
@@ -1399,8 +1351,6 @@ class AlgSolution:
                     self._final_approach_wz = float(wz)
                     if depth > 0.05 and depth <= head_crouch_depth_m:
                         self._target_stage = "PRE_CROUCH"
-                        self._pre_crouch_confirm_count = self.PRE_CROUCH_CONFIRM_STEPS
-                        self._pre_crouch_wait_steps = 0
                         self._log(f"[TaskB-RL] HEAD_APPROACH -> PRE_CROUCH depth={depth:.2f}")
                         return 0.0, 0.0, "START_CROUCH"
                     return vx, wz, "HEAD_APPROACH"
@@ -1411,14 +1361,10 @@ class AlgSolution:
                 head_depth = float(self._active_target.get("depth", 0.0)) if self._active_target is not None else 0.0
                 if head_depth > 0.05 and head_depth <= head_crouch_depth_m:
                     self._target_stage = "PRE_CROUCH"
-                    self._pre_crouch_confirm_count = self.PRE_CROUCH_CONFIRM_STEPS
-                    self._pre_crouch_wait_steps = 0
                     self._log(f"[TaskB-RL] HEAD_APPROACH -> PRE_CROUCH depth={head_depth:.2f}")
                     return 0.0, 0.0, "START_CROUCH"
                 if head_depth > 0.05 and head_depth <= self.HEAD_LOST_DIRECT_CROUCH_DEPTH_M and self._target_lost_count >= self.HEAD_LOST_DIRECT_CROUCH_STEPS:
                     self._target_stage = "PRE_CROUCH"
-                    self._pre_crouch_confirm_count = self.PRE_CROUCH_CONFIRM_STEPS
-                    self._pre_crouch_wait_steps = 0
                     self._log(
                         f"[TaskB-RL] HEAD_APPROACH lost {self._target_lost_count} steps, "
                         f"depth={head_depth:.2f} close enough -> PRE_CROUCH"
@@ -1439,49 +1385,10 @@ class AlgSolution:
                     return 0.0, self.SEARCH_SPIN_WZ, "SEARCH_SPIN"
                 return 0.0, 0.0, "SEARCH_WAIT"
 
-            if self._target_stage == "EE_BASE_ALIGN":
-                center, depth_m = self._get_ee_seg_center(obs)
-                if center is not None:
-                    stage_depth = depth_m if depth_m > 0.05 else float(self._active_target.get("depth", 0.0))
-                    ee_nav = SimpleNamespace(err_u=float(center.err_u), depth_m=float(stage_depth))
-                    vx, wz, _, depth = self._cmd_visual_approach(ee_nav)
-                    self._final_approach_vx = float(vx)
-                    self._final_approach_wz = float(wz)
-                    if center.aligned and depth > 0.05:
-                        self._target_stage = "PRE_CROUCH"
-                        self._pre_crouch_confirm_count = 1
-                        self._log(
-                            f"[TaskB-RL] EE_BASE_ALIGN -> PRE_CROUCH "
-                            f"err=({center.err_u:+.1f},{center.err_v:+.1f}) depth={depth:.2f}"
-                        )
-                        return 0.0, 0.0, "START_CROUCH"
-                    return vx, wz, "EE_BASE_ALIGN"
-
-                self._target_lost_count += 1
-                last_depth = float(self._active_target.get("depth", 0.0)) if self._active_target is not None else 0.0
-                head_crouch_depth_m = self.HEAD_PRE_CROUCH_DEPTH_M + self.HEAD_PRE_CROUCH_DEPTH_EPS_M
-                if last_depth > 0.05 and last_depth <= head_crouch_depth_m:
-                    self._target_stage = "PRE_CROUCH"
-                    self._pre_crouch_confirm_count = 1
-                    self._log(f"[TaskB-RL] EE_BASE_ALIGN lost target -> PRE_CROUCH depth={last_depth:.2f}")
-                    return 0.0, 0.0, "START_CROUCH"
-                if self._target_lost_count <= self.FINAL_APPROACH_KEEP_STEPS:
-                    return self._final_approach_vx, self._final_approach_wz, "EE_BASE_ALIGN"
-                return 0.0, 0.0, "SEARCH_WAIT"
-
             if self._target_stage == "PRE_CROUCH":
                 return 0.0, 0.0, "START_CROUCH"
 
             return *self._cmd_search(), "SEARCH_YOLO"
-
-        if self.perception is not None:
-            phase = str(perc.get("phase") or "approach")
-            grasp = perc.get("target_grasp")
-            nav = perc.get("target_nav")
-            if phase == "grasp" and isinstance(grasp, dict) and grasp.get("grasp_pos_world"):
-                return 0.0, 0.0, "READY_TO_GRASP"
-            if isinstance(nav, dict):
-                return *self._cmd_approach(nav), "APPROACH"
 
         return *self._cmd_search(), "SEARCH"
 
@@ -1505,34 +1412,6 @@ class AlgSolution:
         self._pending_grasp_pos_w = None
         self._pending_grasp_quat_w = None
         self._pregrasp_reach_stable_count = 0
-
-    def _update_grasp(self, perc: dict) -> None:
-        if self._is_standing_phase() or self._hold_carry_pose or self._drop_phase:
-            return
-        if self._task_state in {"GRASP_ARM", "STAND_UP", "CARRY"}:
-            return
-        if str(perc.get("phase") or "") != "grasp":
-            return
-        grasp = perc.get("target_grasp")
-        if not isinstance(grasp, dict) or grasp.get("grasp_pos_world") is None:
-            return
-        self._pending_grasp_target = grasp
-        self._pending_grasp_pos_w = np.asarray(grasp.get("pos_world") or grasp["grasp_pos_world"], dtype=np.float32)
-        gq = grasp.get("grasp_quat_world")
-        self._pending_grasp_quat_w = None if gq is None else np.asarray(gq, dtype=np.float32)
-        if self._task_state in {"SEARCH", "APPROACH"} and self._target_stage != "PRE_CROUCH":
-            return
-        if self._task_state in {"CROUCHING", "PREGRASP"}:
-            return
-        robot = self._robot()
-        if robot is None:
-            return
-        self._crouch_wait_start_step = -1
-        self._reset_sit_down_tracking()
-        self._entered_crouch_from_yolo = False
-        self._leg_posture_controller.start_crouch(robot)
-        self._task_state = "CROUCHING"
-        print(f"[TaskB-RL] start crouch before grasp id={grasp.get('id')} class={grasp.get('class', '?')}", flush=True)
 
     def _lock_carry_pose(self, arm: ArmGraspController) -> None:
         arm.close_gripper()
@@ -1672,263 +1551,6 @@ class AlgSolution:
 
         return action_env
 
-    def _ee_seg_depth_m(self, center, ee_depth: np.ndarray | None) -> float:
-        if ee_depth is None or ee_depth.ndim != 2:
-            return 0.0
-        if center.polygon is not None and len(center.polygon) >= 3:
-            mask = np.zeros_like(ee_depth, dtype=np.uint8)
-            pts = np.round(center.polygon).astype(np.int32).reshape(-1, 1, 2)
-            cv2.fillPoly(mask, [pts], 1)
-            valid = ee_depth[(mask > 0) & (ee_depth > 0.05) & np.isfinite(ee_depth)]
-            if valid.size >= 8:
-                return float(np.median(valid))
-        return sample_depth_median(ee_depth, int(round(center.u)), int(round(center.v)), radius=4)
-
-    def _build_pending_grasp_from_ee_center(self, center, depth_m: float, robot, arm) -> bool:
-        if depth_m <= 0.05 or robot is None or arm is None or self._active_target is None:
-            return False
-        p_cam = pixel_to_cam(center.u, center.v, depth_m, CAM_FX, CAM_FY, CAM_CX, CAM_CY)
-        pos_b = transform_point_cam_to_base(
-            p_cam,
-            self.nav_cfg.robot.ee_cam.pos_b,
-            self.nav_cfg.robot.ee_cam.quat_b,
-        )
-        base_pos_w = robot.data.root_pos_w[0].detach().cpu().numpy()
-        base_quat_w = robot.data.root_quat_w[0].detach().cpu().numpy()
-        pos_w = base_pos_w + quat_rotate_vector(base_quat_w, pos_b)
-        current_ee_quat_w = arm.get_ee_pose()[1]
-        target = {
-            "id": self._active_target.get("id", f"ee_seg_{self._step}"),
-            "class": self._active_target.get("dominant_class", "unknown"),
-            "source": "ee_seg",
-            "u": float(center.u),
-            "v": float(center.v),
-            "depth_m": float(depth_m),
-            "pos_base": np.asarray(pos_b, dtype=np.float32),
-            "pos_world": np.asarray(pos_w, dtype=np.float32),
-            "grasp_pos_world": np.asarray(pos_w, dtype=np.float32),
-            "grasp_quat_world": np.asarray(current_ee_quat_w, dtype=np.float32),
-        }
-        self._pending_grasp_target = target
-        self._pending_grasp_pos_w = np.asarray(pos_w, dtype=np.float32)
-        self._pending_grasp_quat_w = np.asarray(current_ee_quat_w, dtype=np.float32)
-        self._log(
-            f"[TaskB-RL] ee_seg grasp target ready cls={target['class']} "
-            f"depth={depth_m:.2f} pos_b=({pos_b[0]:.3f},{pos_b[1]:.3f},{pos_b[2]:.3f})"
-        )
-        return True
-
-    def _head_target_depth_m(self, head_depth: np.ndarray | None) -> float:
-        if head_depth is None or head_depth.ndim != 2 or self._active_target is None:
-            return 0.0
-        bbox = self._active_target.get("bbox")
-        if bbox is not None and len(bbox) == 4:
-            x1, y1, x2, y2 = [int(v) for v in bbox]
-            h, w = head_depth.shape
-            x1 = max(0, min(w - 1, x1))
-            x2 = max(x1 + 1, min(w, x2))
-            y1 = max(0, min(h - 1, y1))
-            y2 = max(y1 + 1, min(h, y2))
-            patch = head_depth[y1:y2, x1:x2]
-            valid = patch[(patch > 0.05) & np.isfinite(patch)]
-            if valid.size >= 8:
-                return float(np.median(valid))
-        u = float(self._active_target.get("u", 0.0))
-        v = float(self._active_target.get("v", 0.0))
-        if u <= 0.0 and v <= 0.0:
-            return 0.0
-        return sample_depth_median(head_depth, int(round(u)), int(round(v)), radius=4)
-
-    def _get_head_cam_extrinsic(self, robot):
-        scene = self._scene()
-        head_cam = self._get_scene_camera(scene, "head_camera")
-        cfg_pos_b = np.asarray(self.nav_cfg.robot.head_cam.pos_b, dtype=np.float32)
-        cfg_quat_b = np.asarray(self.nav_cfg.robot.head_cam.quat_b, dtype=np.float32)
-        if head_cam is None or robot is None:
-            return cfg_pos_b, cfg_quat_b, {"selected_source": "cfg_offset"}
-        from isaaclab.utils.math import subtract_frame_transforms
-        base_pos = robot.data.root_pos_w[0:1]
-        base_quat = robot.data.root_quat_w[0:1]
-        base_pos_np = base_pos[0].detach().cpu().numpy().astype(np.float32)
-        base_quat_np = base_quat[0].detach().cpu().numpy().astype(np.float32)
-        fk_cam_pos_w = base_pos_np + quat_rotate_vector(base_quat_np, cfg_pos_b)
-        fk_cam_quat_w = quat_multiply(base_quat_np, cfg_quat_b)
-        debug = {
-            "selected_source": "cfg_offset",
-            "base_pos_w": base_pos_np,
-            "base_quat_w": base_quat_np,
-            "cfg_pos_b": cfg_pos_b,
-            "cfg_quat_b": cfg_quat_b,
-            "fk_cam_pos_w": fk_cam_pos_w.astype(np.float32),
-            "fk_cam_quat_w": fk_cam_quat_w.astype(np.float32),
-            "sensor_candidates": {},
-        }
-        if hasattr(head_cam.data, "pos_w"):
-            cam_pos_w = head_cam.data.pos_w[0:1]
-            debug["sensor_pos_w"] = cam_pos_w[0].detach().cpu().numpy().astype(np.float32)
-            for attr in ("quat_w_ros", "quat_w_world", "quat_w"):
-                if not hasattr(head_cam.data, attr):
-                    continue
-                cam_quat_w = getattr(head_cam.data, attr)[0:1]
-                pos_b_t, quat_b_t = subtract_frame_transforms(base_pos, base_quat, cam_pos_w, cam_quat_w)
-                debug["sensor_candidates"][attr] = {
-                    "pos_b": pos_b_t[0].detach().cpu().numpy().astype(np.float32),
-                    "quat_b": quat_b_t[0].detach().cpu().numpy().astype(np.float32),
-                    "quat_w": cam_quat_w[0].detach().cpu().numpy().astype(np.float32),
-                }
-        return cfg_pos_b, cfg_quat_b, debug
-
-    def _build_pending_grasp_from_head_target(self, obs: dict, robot, arm) -> bool:
-        if robot is None or arm is None or self._active_target is None:
-            return False
-        if str(self._active_target.get("source", "")) != "head":
-            return False
-        head_depth = parse_depth((obs.get("image") or {}), "head_depth")
-        depth_m = self._head_target_depth_m(head_depth)
-        if depth_m <= 0.05:
-            return False
-        u = float(self._active_target.get("u", 0.0))
-        v = float(self._active_target.get("v", 0.0))
-        p_cam = pixel_to_cam(u, v, depth_m, CAM_FX, CAM_FY, CAM_CX, CAM_CY)
-        cam_pos_b, cam_quat_b, cam_debug = self._get_head_cam_extrinsic(robot)
-        pos_b = transform_point_cam_to_base(p_cam, cam_pos_b, cam_quat_b)
-        base_pos_w = robot.data.root_pos_w[0].detach().cpu().numpy()
-        base_quat_w = robot.data.root_quat_w[0].detach().cpu().numpy()
-        pos_w = base_pos_w + quat_rotate_vector(base_quat_w, pos_b)
-        pos_w[2] = 0.05
-        pos_b = quat_rotate_vector(
-            np.array([base_quat_w[0], -base_quat_w[1], -base_quat_w[2], -base_quat_w[3]], dtype=np.float32),
-            np.asarray(pos_w, dtype=np.float32) - np.asarray(base_pos_w, dtype=np.float32),
-        )
-        candidate_3d_lines = []
-        if cam_debug is not None:
-            for name, candidate in cam_debug.get("sensor_candidates", {}).items():
-                cand_pos_b = transform_point_cam_to_base(p_cam, candidate["pos_b"], candidate["quat_b"])
-                cand_pos_w = base_pos_w + quat_rotate_vector(base_quat_w, cand_pos_b)
-                candidate_3d_lines.append(
-                    f"  3D_{name}: pos_b=({cand_pos_b[0]:.3f},{cand_pos_b[1]:.3f},{cand_pos_b[2]:.3f}) "
-                    f"pos_w=({cand_pos_w[0]:.3f},{cand_pos_w[1]:.3f},{cand_pos_w[2]:.3f})"
-                )
-        target = {
-            "id": self._active_target.get("id", f"head_rgbd_{self._step}"),
-            "class": self._active_target.get("dominant_class", "unknown"),
-            "source": "head_rgbd",
-            "u": u,
-            "v": v,
-            "depth_m": float(depth_m),
-            "pos_base": np.asarray(pos_b, dtype=np.float32),
-            "pos_world": np.asarray(pos_w, dtype=np.float32),
-            "grasp_pos_world": np.asarray(pos_w, dtype=np.float32),
-            "grasp_quat_world": None,
-        }
-        self._pending_grasp_target = target
-        self._pending_grasp_pos_w = np.asarray(pos_w, dtype=np.float32)
-        self._pending_grasp_quat_w = None
-        gt_pos_w, gt_err = self._nearest_gt_world_pos(target["class"], np.asarray(pos_w, dtype=np.float32))
-        gt_info = " gt_w=(n/a)"
-        gt_base_info = ""
-        if gt_pos_w is not None and gt_err is not None:
-            gt_info = (
-                f" gt_w=({gt_pos_w[0]:.3f},{gt_pos_w[1]:.3f},{gt_pos_w[2]:.3f})"
-                f" err=({gt_err[0]:+.3f},{gt_err[1]:+.3f},{gt_err[2]:+.3f})"
-            )
-            gt_pos_b = quat_rotate_vector(
-                np.array([base_quat_w[0], -base_quat_w[1], -base_quat_w[2], -base_quat_w[3]], dtype=np.float32),
-                np.asarray(gt_pos_w, dtype=np.float32) - np.asarray(base_pos_w, dtype=np.float32),
-            )
-            gt_base_info = (
-                f" gt_b=({gt_pos_b[0]:.3f},{gt_pos_b[1]:.3f},{gt_pos_b[2]:.3f})"
-                f" sel_err_b=({pos_b[0]-gt_pos_b[0]:+.3f},{pos_b[1]-gt_pos_b[1]:+.3f},{pos_b[2]-gt_pos_b[2]:+.3f})"
-            )
-        cam_world_info = ""
-        if cam_debug is not None:
-            cam_world_info = (
-                f"  selected_extrinsic[{cam_debug.get('selected_source', 'unknown')}]: "
-                f"pos_b=({cam_pos_b[0]:.4f},{cam_pos_b[1]:.4f},{cam_pos_b[2]:.4f}) "
-                f"quat_b=({cam_quat_b[0]:.4f},{cam_quat_b[1]:.4f},{cam_quat_b[2]:.4f},{cam_quat_b[3]:.4f})\n"
-                f"  base_w:   pos=({cam_debug['base_pos_w'][0]:.4f},{cam_debug['base_pos_w'][1]:.4f},{cam_debug['base_pos_w'][2]:.4f}) "
-                f"quat=({cam_debug['base_quat_w'][0]:.4f},{cam_debug['base_quat_w'][1]:.4f},{cam_debug['base_quat_w'][2]:.4f},{cam_debug['base_quat_w'][3]:.4f})\n"
-                f"  camera_fk_w: pos=({cam_debug['fk_cam_pos_w'][0]:.4f},{cam_debug['fk_cam_pos_w'][1]:.4f},{cam_debug['fk_cam_pos_w'][2]:.4f}) "
-                f"quat=({cam_debug['fk_cam_quat_w'][0]:.4f},{cam_debug['fk_cam_quat_w'][1]:.4f},{cam_debug['fk_cam_quat_w'][2]:.4f},{cam_debug['fk_cam_quat_w'][3]:.4f})\n"
-            )
-            if "sensor_pos_w" in cam_debug:
-                cam_world_info += (
-                    f"  camera_sensor_w: pos=({cam_debug['sensor_pos_w'][0]:.4f},{cam_debug['sensor_pos_w'][1]:.4f},{cam_debug['sensor_pos_w'][2]:.4f})\n"
-                )
-            for name, candidate in cam_debug.get("sensor_candidates", {}).items():
-                cam_world_info += (
-                    f"  extrinsic_{name}: pos_b=({candidate['pos_b'][0]:.4f},{candidate['pos_b'][1]:.4f},{candidate['pos_b'][2]:.4f}) "
-                    f"quat_b=({candidate['quat_b'][0]:.4f},{candidate['quat_b'][1]:.4f},{candidate['quat_b'][2]:.4f},{candidate['quat_b'][3]:.4f})\n"
-                )
-        self._log(
-            f"[TaskB-RL] head rgbd grasp target ready cls={target['class']}\n"
-            f"  RGBD: u={u:.1f} v={v:.1f} depth={depth_m:.3f} p_cam=({p_cam[0]:.3f},{p_cam[1]:.3f},{p_cam[2]:.3f})\n"
-            f"{cam_world_info}"
-            f"  3D_selected: pos_b=({pos_b[0]:.3f},{pos_b[1]:.3f},{pos_b[2]:.3f}) pos_w=({pos_w[0]:.3f},{pos_w[1]:.3f},{pos_w[2]:.3f}){gt_info}{gt_base_info}"
-            f"{'' if not candidate_3d_lines else chr(10) + chr(10).join(candidate_3d_lines)}"
-        )
-        return True
-
-    def _nearest_gt_world_pos(self, class_name: str, est_pos_w: np.ndarray) -> tuple[np.ndarray | None, np.ndarray | None]:
-        scene = self._scene()
-        if scene is None:
-            return None, None
-        try:
-            class_id = CLASS_NAMES.index(class_name)
-        except ValueError:
-            return None, None
-        best_pos_w = None
-        best_dist = None
-        for obj_idx in range(1, NUM_OBJECTS + 1):
-            if object_index_to_class(obj_idx) != class_id:
-                continue
-            try:
-                obj = scene[f"object_{obj_idx}"]
-            except Exception:
-                continue
-            if not hasattr(obj, "data") or not hasattr(obj.data, "root_pos_w"):
-                continue
-            pos_w = obj.data.root_pos_w[0, :3].detach().cpu().numpy().astype(np.float32)
-            dist = float(np.linalg.norm(pos_w - est_pos_w))
-            if best_dist is None or dist < best_dist:
-                best_dist = dist
-                best_pos_w = pos_w
-        if best_pos_w is None:
-            return None, None
-        return best_pos_w, est_pos_w - best_pos_w
-
-    def _get_ee_seg_center(self, obs: dict) -> tuple[Any | None, float]:
-        if not self._ee_seg.ready or self._active_target is None:
-            return None, 0.0
-        scene = self._scene()
-        ee_camera = self._get_scene_camera(scene, "ee_camera")
-        ee_rgb = self._get_camera_output(ee_camera, "ee_camera", "rgb") if ee_camera is not None else None
-        ee_depth = parse_depth((obs.get("image") or {}), "ee_depth")
-        if ee_rgb is None:
-            return None, 0.0
-        if isinstance(ee_rgb, torch.Tensor):
-            ee_rgb = ee_rgb.detach().cpu().numpy()
-        ee_rgb = np.squeeze(ee_rgb)
-        if ee_rgb.ndim == 3 and ee_rgb.shape[0] in (3, 4) and ee_rgb.shape[-1] not in (3, 4):
-            ee_rgb = np.transpose(ee_rgb, (1, 2, 0))
-        if ee_rgb.shape[-1] == 4:
-            ee_rgb = ee_rgb[..., :3]
-        if ee_rgb.dtype != np.uint8:
-            if ee_rgb.max() <= 1.0:
-                ee_rgb = (ee_rgb * 255.0).clip(0, 255).astype(np.uint8)
-            else:
-                ee_rgb = ee_rgb.astype(np.uint8)
-        ee_rgb = np.ascontiguousarray(ee_rgb)
-        target_class_name = str(self._active_target.get("dominant_class", "unknown"))
-        try:
-            target_class = ObjectClass(target_class_name)
-        except ValueError:
-            target_class = None
-        center = self._ee_seg.best_center(ee_rgb, target_class=target_class)
-        if center is None:
-            return None, 0.0
-        return center, self._ee_seg_depth_m(center, ee_depth)
-
     def _step_crouch(self, obs: dict) -> torch.Tensor:
         zero_cmd = np.zeros(3, dtype=np.float32)
         robot = self._robot()
@@ -1971,7 +1593,6 @@ class AlgSolution:
 
         if crouch_ready:
             self._task_state = "PREGRASP"
-            self._ee_align_step = 0
             self._arm_crouch_alpha = 0.0
             self._pregrasp_reach_stable_count = 0
             self._pregrasp_arm_settle_count = 0
@@ -2192,8 +1813,6 @@ class AlgSolution:
     def _log_status(self, perc: dict, vx: float, wz: float, state: str) -> None:
         if self._step % 10 != 0:
             return
-        nav = perc.get("target_nav") or {}
-        nd = self._nav_depth(nav) if nav else 0.0
         if self._active_target is not None:
             yolo_info = (
                 f"active={self._active_target.get('dominant_class', '-')} "
@@ -2215,14 +1834,11 @@ class AlgSolution:
 
         locked_info = (
             f" target_stage={self._target_stage} lost={self._target_lost_count} "
-            f"head_confirm={self._head_confirm_count}/{self.HEAD_CONFIRM_STEPS} "
-            f"pre_crouch={self._pre_crouch_confirm_count}/{self.PRE_CROUCH_CONFIRM_STEPS}"
         )
 
         print(
             f"[TaskB] step={self._step} state={state} drop={self._drop_phase or '-'} "
-            f"perc={perc.get('phase')} ee={len(perc.get('ee_objects') or [])} "
-            f"nav_d={nd:.2f} bin_d={self._dist_to_bin(perc):.2f} dropped={self._objects_dropped} "
+            f"bin_d={self._dist_to_bin(perc):.2f} dropped={self._objects_dropped} "
             f"cmd=({vx:.2f},{wz:.2f}) {yolo_info}{locked_info}{last_seen_info}",
             flush=True,
         )
@@ -2238,11 +1854,11 @@ class AlgSolution:
         self._last_nav_vel = self.axis_nav.compute_velocity(obs)
         self._update_last_seen_target()
         self._save_yolo_detection(obs)
-        perc = self.perception.process(obs, self.dt) if self.perception is not None else {}
+        perc = {}
 
         vx, wz, nav_state = self._choose_velocity(perc, obs)
 
-        if nav_state in {"EE_TRACK", "FINAL_APPROACH", "HEAD_APPROACH", "EE_BASE_ALIGN", "SEARCH_SPIN"}:
+        if nav_state in {"EE_TRACK", "HEAD_APPROACH", "SEARCH_SPIN"}:
             vx, wz = self._smooth_cmd(vx, wz)
         else:
             self._cmd_vx_filt = float(vx)
@@ -2259,7 +1875,6 @@ class AlgSolution:
             robot = self._robot()
             if robot is not None and self._task_state not in {"PRE_CROUCH_SETTLE", "CROUCHING", "PREGRASP", "GRASP_ARM", "STAND_UP"}:
                 self._pre_crouch_settle_steps = 0
-                self._pre_crouch_wait_steps = 0
                 self._arm_crouch_alpha = 0.0
                 self._crouch_arm_hold_jpos = None
                 self._task_state = "PRE_CROUCH_SETTLE"
@@ -2268,7 +1883,7 @@ class AlgSolution:
 
         protected_states = {"PRE_CROUCH_SETTLE", "CROUCHING", "PREGRASP", "GRASP_ARM", "STAND_UP", "CARRY", "DROP"}
 
-        if nav_state in {"EE_TRACK", "FINAL_APPROACH", "HEAD_APPROACH", "EE_BASE_ALIGN", "PRE_CROUCH"}:
+        if nav_state in {"EE_TRACK", "HEAD_APPROACH", "PRE_CROUCH"}:
             if self._task_state == "SEARCH":
                 self._task_state = "APPROACH"
         elif nav_state in {"SEARCH_WAIT", "SEARCH_SPIN"}:
@@ -2278,7 +1893,6 @@ class AlgSolution:
             self._task_state = nav_state
 
         self._set_velocity_commands(vx, 0.0, wz)
-        self._update_grasp(perc)
 
         base_cmd = np.array([vx, 0.0, wz], dtype=np.float32)
         robot = self._robot()
